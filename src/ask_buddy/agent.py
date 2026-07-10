@@ -88,6 +88,17 @@ explicitly asks about a past version.
 """
 
 
+def current_agent_config() -> str:
+    """
+    A short identifier for the LLM/agent config that produced an answer,
+    e.g. 'settings.google.toml:gemini-2.5-flash'. Stored on each feedback
+    row so answer quality can be compared across configs (A/B) later.
+    """
+    setting = os.environ.get("AGENT_SETTING_CONFIG", "default")
+    model = os.environ.get("MODEL_NAME", "default")
+    return f"{setting}:{model}"
+
+
 def build_agent(slack_post_fn: Callable[[str, str], None]) -> CugaAgent:
     """
     Build and return a CugaAgent configured as Ask Buddy.

@@ -82,21 +82,35 @@ def _post_answer_with_feedback(
     channel: str,
     answer_text: str,
     question: str,
+    retrieved_chunk_ids: list[int] | None = None,
+    agent_config: str | None = None,
 ) -> None:
     """
     Post the answer as a Block Kit message with 👍 / 👎 buttons,
     and pre-insert a pending row in ask_buddy_feedback.
+
+    Refusals are tagged is_refusal=TRUE and store no chunk IDs (the agent
+    refuses without using retrieval), so downstream chunk-quality scoring
+    only counts real answers.
     """
     from .feedback import (
         new_response_id, build_answer_blocks,
-        store_feedback_row, extract_sources,
+        store_feedback_row, extract_sources, is_refusal_text,
     )
     response_id = new_response_id()
     sources = extract_sources(answer_text)
-    blocks = build_answer_blocks(answer_text, question, response_id)
+    refusal = is_refusal_text(answer_text)
+    chunk_ids = None if refusal else retrieved_chunk_ids
+    blocks = build_answer_blocks(answer_text, question, response_id,
+                                 is_refusal=refusal)
 
     try:
-        store_feedback_row(response_id, question, answer_text, sources)
+        store_feedback_row(
+            response_id, question, answer_text, sources,
+            retrieved_chunk_ids=chunk_ids,
+            is_refusal=refusal,
+            agent_config=agent_config,
+        )
     except Exception:
         log.warning("[feedback] could not store pending row:\n%s",
                     traceback.format_exc())
@@ -106,7 +120,8 @@ def _post_answer_with_feedback(
         text=answer_text,          # fallback for notifications
         blocks=blocks,
     )
-    log.info("[feedback] posted response_id=%s", response_id)
+    log.info("[feedback] posted response_id=%s refusal=%s chunks=%s",
+             response_id, refusal, chunk_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -123,9 +138,17 @@ def _run_agent_for_message(user_text: str, channel: str, user: str,
     Running in a thread gives us a clean loop via asyncio.run().
     """
     posted_answers: list[str] = []   # track what the agent posted via the tool
+    retrieved_chunk_ids: list[int] = []   # filled from the pre-retrieval below
+
+    from src.ask_buddy.agent import current_agent_config
+    agent_config = current_agent_config()
 
     def _post(ch: str, text: str) -> None:
-        _post_answer_with_feedback(ch, text, user_text)
+        _post_answer_with_feedback(
+            ch, text, user_text,
+            retrieved_chunk_ids=list(retrieved_chunk_ids),
+            agent_config=agent_config,
+        )
         posted_answers.append(text)
 
     prompt = (
@@ -144,6 +167,11 @@ def _run_agent_for_message(user_text: str, channel: str, user: str,
         chunks = hybrid_retrieve.invoke({"query": user_text, "top_k": 5})
         if chunks and "error" in chunks[0]:
             raise RuntimeError(f"hybrid_retrieve error: {chunks[0]['error']}")
+        # Record the chunk IDs surfaced for this question so feedback can be
+        # attributed back to specific source chunks. This is the pre-retrieval
+        # set; the agent may reformulate internally, but this is a faithful
+        # proxy for which chunks the answer is grounded in.
+        retrieved_chunk_ids[:] = [c["id"] for c in chunks if "id" in c]
         log.info("[agent] retrieved %d chunks: %s",
                  len(chunks), [c.get("source_filename") for c in chunks])
 

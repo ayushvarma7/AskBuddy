@@ -17,6 +17,20 @@ from typing import Any
 from .db import get_conn
 
 
+# The exact refusal string the agent emits for out-of-scope / no-result
+# questions. Kept here as the single source of truth so the listener,
+# feedback tagging, and reporting all agree on what counts as a refusal.
+REFUSAL_TEXT = (
+    "No results found in our HR documents for that question — please "
+    "reach out to HR or your manager for help."
+)
+
+
+def is_refusal_text(answer_text: str) -> bool:
+    """True when an answer is the canonical 'no results' refusal message."""
+    return answer_text.strip() == REFUSAL_TEXT.strip()
+
+
 # ---------------------------------------------------------------------------
 # Block Kit builder
 # ---------------------------------------------------------------------------
@@ -25,6 +39,7 @@ def build_answer_blocks(
     answer_text: str,
     question: str,
     response_id: str,
+    is_refusal: bool = False,
 ) -> list[dict[str, Any]]:
     """
     Return a Slack Block Kit block list:
@@ -35,8 +50,20 @@ def build_answer_blocks(
 
     The button values carry a JSON payload so the action handler can
     recover the response_id without a DB lookup on every click.
+
+    For refusals the prompt/labels change so a 👎 unambiguously means
+    "this should have been answerable" — the strongest doc-gap signal.
     """
     payload_base = json.dumps({"response_id": response_id, "question": question[:200]})
+
+    if is_refusal:
+        prompt = "Should Ask Buddy have been able to answer this?"
+        pos_label = "👍  Correct — not an HR topic"
+        neg_label = "👎  This should be in our HR docs"
+    else:
+        prompt = "Was this helpful?"
+        pos_label = "👍  Helpful"
+        neg_label = "👎  Not helpful"
 
     return [
         # Answer text
@@ -46,21 +73,26 @@ def build_answer_blocks(
         },
         # Thin divider
         {"type": "divider"},
-        # Feedback prompt + buttons
+        # Feedback prompt
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": prompt}],
+        },
+        # Feedback buttons
         {
             "type": "actions",
             "block_id": f"feedback_{response_id}",
             "elements": [
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "👍  Helpful", "emoji": True},
+                    "text": {"type": "plain_text", "text": pos_label, "emoji": True},
                     "style": "primary",
                     "action_id": "feedback_positive",
                     "value": payload_base,
                 },
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "👎  Not helpful", "emoji": True},
+                    "text": {"type": "plain_text", "text": neg_label, "emoji": True},
                     "action_id": "feedback_negative",
                     "value": payload_base,
                 },
@@ -101,6 +133,9 @@ def store_feedback_row(
     question: str,
     answer_text: str,
     sources_cited: str,
+    retrieved_chunk_ids: list[int] | None = None,
+    is_refusal: bool = False,
+    agent_config: str | None = None,
 ) -> None:
     """
     Insert a pending row into ask_buddy_feedback when the answer is posted.
@@ -108,9 +143,11 @@ def store_feedback_row(
     """
     sql = """
         INSERT INTO ask_buddy_feedback
-            (response_id, question, answer_text, sources_cited)
+            (response_id, question, answer_text, sources_cited,
+             retrieved_chunk_ids, is_refusal, agent_config)
         VALUES
-            (%(response_id)s, %(question)s, %(answer_text)s, %(sources_cited)s)
+            (%(response_id)s, %(question)s, %(answer_text)s, %(sources_cited)s,
+             %(retrieved_chunk_ids)s, %(is_refusal)s, %(agent_config)s)
         ON CONFLICT (response_id) DO NOTHING;
     """
     with get_conn() as conn:
@@ -120,6 +157,10 @@ def store_feedback_row(
                 "question": question,
                 "answer_text": answer_text,
                 "sources_cited": sources_cited,
+                # psycopg2 adapts a Python list to a Postgres array; None → NULL.
+                "retrieved_chunk_ids": retrieved_chunk_ids or None,
+                "is_refusal": is_refusal,
+                "agent_config": agent_config,
             })
 
 
