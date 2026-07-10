@@ -207,6 +207,67 @@ def get_chunk_quality() -> dict[int, dict[str, int]]:
     return quality
 
 
+def get_low_quality_chunks(min_negative: int = 3) -> list[dict]:
+    """
+    Return chunks that have accumulated >= min_negative thumbs-down across
+    the answers that cited them, joined to their source text for review.
+
+    Each dict: chunk_id, source_filename, section, chunk_text, positive,
+    negative, net — ordered worst (most negative) first. This is the
+    content-review queue: the underlying HR doc text may be wrong/ambiguous.
+    """
+    sql = """
+        SELECT c.id                AS chunk_id,
+               c.source_filename,
+               c.section,
+               c.chunk_text,
+               q.positive,
+               q.negative,
+               q.positive - q.negative AS net
+        FROM (
+            SELECT chunk_id,
+                   COUNT(*) FILTER (WHERE feedback = 'positive') AS positive,
+                   COUNT(*) FILTER (WHERE feedback = 'negative') AS negative
+            FROM ask_buddy_feedback,
+                 LATERAL unnest(retrieved_chunk_ids) AS chunk_id
+            WHERE feedback IS NOT NULL
+              AND retrieved_chunk_ids IS NOT NULL
+            GROUP BY chunk_id
+        ) q
+        JOIN hr_chunks c ON c.id = q.chunk_id
+        WHERE q.negative >= %(min_negative)s
+        ORDER BY q.negative DESC, net ASC;
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, {"min_negative": min_negative})
+            return [dict(r) for r in cur.fetchall()]
+
+
+def get_negative_feedback_rows(since_days: int | None = None) -> list[dict]:
+    """
+    Return negatively-rated rows (question, answer, reason, sources, refusal,
+    created_at), optionally limited to the last `since_days`. Used by the
+    report clustering / eval export and the weekly digest.
+    """
+    where = "feedback = 'negative'"
+    params: dict = {}
+    if since_days is not None:
+        where += " AND created_at >= now() - (%(since_days)s || ' days')::interval"
+        params["since_days"] = since_days
+    sql = f"""
+        SELECT question, answer_text, feedback_reason, sources_cited,
+               is_refusal, created_at
+        FROM ask_buddy_feedback
+        WHERE {where}
+        ORDER BY created_at DESC;
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
+
+
 def clear_chunks() -> None:
     """Truncate the hr_chunks table (used before a full re-ingest)."""
     with get_conn() as conn:
