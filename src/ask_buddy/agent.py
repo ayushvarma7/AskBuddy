@@ -88,6 +88,44 @@ explicitly asks about a past version.
 """
 
 
+def _fewshot_block() -> str:
+    """
+    Optional few-shot examples appended to the system prompt, curated from
+    the highest-rated past answers. Off by default; enable by setting
+    ASK_BUDDY_FEWSHOT to the number of examples to include (e.g. 3).
+
+    This is a manual "prompt tuning from feedback" loop — good answers the
+    users liked become exemplars that reinforce the desired format.
+    """
+    try:
+        n = int(os.environ.get("ASK_BUDDY_FEWSHOT", "0") or "0")
+    except ValueError:
+        n = 0
+    if n <= 0:
+        return ""
+
+    try:
+        from .db import get_positive_examples
+        examples = get_positive_examples(limit=n)
+    except Exception:
+        # Never let feedback lookup break agent construction.
+        return ""
+
+    if not examples:
+        return ""
+
+    blocks = []
+    for ex in examples:
+        blocks.append(
+            f"Q: {ex['question']}\nA: {ex['answer_text']}"
+        )
+    joined = "\n\n".join(blocks)
+    return (
+        "\n\n== EXAMPLES OF GOOD ANSWERS (users rated these helpful) ==\n"
+        "Match this style and Sources formatting:\n\n" + joined
+    )
+
+
 def current_agent_config() -> str:
     """
     A short identifier for the LLM/agent config that produced an answer,
@@ -123,6 +161,6 @@ def build_agent(slack_post_fn: Callable[[str, str], None]) -> CugaAgent:
     agent = CugaAgent(
         tools=[hybrid_retrieve, post_slack_message],
         enable_knowledge=False,   # we manage our own retrieval
-        special_instructions=SYSTEM_PROMPT,
+        special_instructions=SYSTEM_PROMPT + _fewshot_block(),
     )
     return agent

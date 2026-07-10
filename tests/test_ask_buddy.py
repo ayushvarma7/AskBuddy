@@ -340,3 +340,54 @@ class TestAgentMockedSlack:
         assert any("C1234" in m["channel"] for m in posted), (
             "post_slack_message must use the channel from the prompt"
         )
+
+
+# ---------------------------------------------------------------------------
+# TC-7: Regression evals curated from real negative feedback
+# ---------------------------------------------------------------------------
+#
+# Workflow:
+#   1. Export candidates:
+#        uv run python -m src.ask_buddy.feedback_report --export-evals tests/regression_evals.json
+#   2. A human fills in "expected_sources" (list of source_filename strings)
+#      for each question that SHOULD be answerable.
+#   3. This test asserts retrieval still surfaces at least one expected source
+#      for each curated case — so a prompt/model/chunking change can't silently
+#      regress on a question users already flagged.
+#
+# It skips cleanly when the curated file is absent, so it never blocks CI
+# until someone opts in by committing regression_evals.json.
+
+import json as _json
+from pathlib import Path as _Path
+
+_EVAL_FILE = _Path(__file__).parent / "regression_evals.json"
+
+
+def _load_curated_evals() -> list[dict]:
+    if not _EVAL_FILE.exists():
+        return []
+    try:
+        data = _json.loads(_EVAL_FILE.read_text())
+    except _json.JSONDecodeError:
+        return []
+    # Only cases a human has annotated with expected_sources are actionable.
+    return [c for c in data if c.get("expected_sources")]
+
+
+@integration
+@pytest.mark.skipif(
+    not _load_curated_evals(),
+    reason="No curated tests/regression_evals.json with expected_sources",
+)
+class TestFeedbackRegressionEvals:
+    @pytest.mark.parametrize("case", _load_curated_evals())
+    def test_expected_source_is_retrieved(self, case):
+        from src.ask_buddy.retrieve import hybrid_retrieve
+        results = hybrid_retrieve.invoke({"query": case["question"], "top_k": 8})
+        got = {r.get("source_filename") for r in results if "error" not in r}
+        expected = set(case["expected_sources"])
+        assert got & expected, (
+            f"Regression: {case['question']!r} should surface one of "
+            f"{expected}; retrieval returned {got}"
+        )

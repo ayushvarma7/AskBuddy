@@ -244,6 +244,28 @@ def get_low_quality_chunks(min_negative: int = 3) -> list[dict]:
             return [dict(r) for r in cur.fetchall()]
 
 
+def get_positive_examples(limit: int = 3) -> list[dict]:
+    """
+    Return the most-liked distinct (question, answer_text) pairs for use as
+    few-shot examples in the system prompt. Excludes refusals and answers
+    with no Source(s) line so only well-formed exemplars are surfaced.
+    """
+    sql = """
+        SELECT DISTINCT ON (question) question, answer_text,
+               COUNT(*) OVER (PARTITION BY question) AS likes
+        FROM ask_buddy_feedback
+        WHERE feedback = 'positive'
+          AND is_refusal = FALSE
+          AND answer_text ILIKE '%%Source(s):%%'
+        ORDER BY question, likes DESC
+        LIMIT %(limit)s;
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, {"limit": limit})
+            return [dict(r) for r in cur.fetchall()]
+
+
 def get_negative_feedback_rows(since_days: int | None = None) -> list[dict]:
     """
     Return negatively-rated rows (question, answer, reason, sources, refusal,
