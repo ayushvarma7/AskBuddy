@@ -1,0 +1,23 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: askbuddy_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: askbuddy
+      POSTGRES_USER: askbuddy
+      POSTGRES_PASSWORD: askbuddy_secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - askbuddy_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U askbuddy -d askbuddy"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  askbuddy_pgdata:

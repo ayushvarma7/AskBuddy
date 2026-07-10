@@ -1,0 +1,19 @@
+[project]
+name = "meeting-scribe"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "cuga>=0.3.0",
+    "tavily-python>=0.7.26",
+    # Ask Buddy — agentic HR RAG bot for Slack
+    "langchain-google-genai>=2.0.0",
+    "psycopg2-binary>=2.9.9",
+    "pgvector>=0.3.2",
+    "slack-bolt>=1.18.1",
+    "python-dotenv>=1.0.1",
+    "rank-bm25>=0.2.2",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

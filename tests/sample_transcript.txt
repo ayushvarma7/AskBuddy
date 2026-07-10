@@ -1,0 +1,41 @@
+Sarah: Good morning everyone. Thanks for joining the Q4 planning sync. Let's dive right in.
+
+Mike: Morning. I wanted to start with the API redesign project. We've been pushing this back for three quarters now, and it's starting to impact our ability to onboard new partners.
+
+Sarah: You're absolutely right. Mike, can you take the lead on scoping out the API redesign? I'd like a proposal by next Friday.
+
+Mike: Yes, I'll get that done. I'll include timeline estimates and resource requirements.
+
+Emma: While we're talking about technical debt, the mobile app performance issues are getting worse. We're seeing a 30% increase in crash reports this month.
+
+Sarah: That's concerning. Emma, could you investigate the root cause this week and report back?
+
+Emma: Sure, I'll dig into the crash logs and identify the top issues.
+
+Alex: I have a question about the database migration. Are we still planning to move forward with that?
+
+Sarah: Good question. We need to revisit the database migration plan, but only after Seb confirms the infrastructure is ready. He's been working on the capacity planning.
+
+Mike: Right, we can't make that decision without his input. Should we schedule a follow-up meeting for that?
+
+Sarah: Yes, let's do that. I'll send out a calendar invite for next Tuesday to discuss the database migration once Seb is back from his conference.
+
+Emma: Speaking of databases, we decided last week to go with PostgreSQL instead of MySQL, correct?
+
+Sarah: Yes, that's the final decision. PostgreSQL it is. Let's make sure that's documented in the tech specs.
+
+Alex: One more thing - someone should update the onboarding documentation. It's really outdated and new engineers are getting confused.
+
+Sarah: That's important, but I don't think anyone here has bandwidth right now. Let's flag that as needing an owner and bring it up in the next all-hands.
+
+Mike: Agreed. We can't just assign it randomly.
+
+Emma: Makes sense. I think that covers everything on my end.
+
+Sarah: Great. So to summarize: Mike is handling the API redesign proposal, Emma is investigating the mobile crashes, and we'll follow up on the database migration next Tuesday. Anything else?
+
+Mike: Nope, that's it from me.
+
+Emma: All good here.
+
+Sarah: Perfect. Thanks everyone, let's reconvene next week.
