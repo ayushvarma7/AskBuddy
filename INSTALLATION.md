@@ -413,9 +413,29 @@ retrieval keeps surfacing those sources so a future change can't silently regres
 ### Weekly digest to Slack (optional)
 
 Instead of running the report by hand, post a weekly negative-feedback +
-doc-gap digest to a Slack channel. Set `ASK_BUDDY_DIGEST_CHANNEL` in `.env`
-to the target channel id, then:
+doc-gap digest to a Slack channel.
 
+**1. Get the channel ID.** Channel IDs look like `C0123ABCD` — they are
+**not** the channel name. Two ways to find one:
+- In Slack, open the target channel → click the channel name at the top →
+  **About** tab → scroll to the bottom, or
+- Right-click the channel in the sidebar → **Copy link** → the ID is the
+  last segment of the URL, e.g. `https://yourteam.slack.com/archives/C0123ABCD`.
+
+**2. Invite the bot to that channel** (required to post there):
+```
+/invite @Ask Buddy
+```
+
+**3. Add the ID to `.env`.** Open `.env` (not `.env.example`) and set:
+```dotenv
+ASK_BUDDY_DIGEST_CHANNEL=C0123ABCD
+```
+This line already exists as a commented-out placeholder in `.env.example`
+under the *Ask Buddy — HR RAG Bot for Slack* section — uncomment it in your
+own `.env` and replace the value with the real channel ID from step 1.
+
+**4. Run it:**
 ```bash
 # Preview without posting:
 uv run python -m src.ask_buddy.feedback_digest --dry-run
@@ -423,6 +443,8 @@ uv run python -m src.ask_buddy.feedback_digest --dry-run
 # Post to the configured channel:
 uv run python -m src.ask_buddy.feedback_digest
 ```
+If `ASK_BUDDY_DIGEST_CHANNEL` is missing, the command exits with an error
+telling you to set it (or pass `--dry-run` instead).
 
 Schedule it with cron (Mondays 09:00 shown) — the bot itself does not schedule it:
 ```cron
