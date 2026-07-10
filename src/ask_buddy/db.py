@@ -8,6 +8,47 @@ import psycopg2.extras
 from contextlib import contextmanager
 
 
+# ---------------------------------------------------------------------------
+# Feedback table DDL (shared by init_schema and init_feedback_schema)
+# ---------------------------------------------------------------------------
+#
+# retrieved_chunk_ids : hr_chunks.id[] surfaced for this answer — lets us score
+#                       chunk quality from downstream feedback.
+# is_refusal          : TRUE when the answer was the "No results found" message.
+# feedback_reason     : category chosen in the 👎 modal (wrong_info, no_source, …).
+# agent_config        : which LLM/agent config produced the answer (for A/B).
+_FEEDBACK_TABLE_DDL = """
+    CREATE TABLE IF NOT EXISTS ask_buddy_feedback (
+        id                  SERIAL PRIMARY KEY,
+        response_id         TEXT        NOT NULL UNIQUE,
+        question            TEXT        NOT NULL,
+        answer_text         TEXT        NOT NULL,
+        sources_cited       TEXT        NOT NULL DEFAULT '',
+        feedback            TEXT        CHECK (feedback IN ('positive','negative')),
+        user_id             TEXT,
+        retrieved_chunk_ids INTEGER[],
+        is_refusal          BOOLEAN     NOT NULL DEFAULT FALSE,
+        feedback_reason     TEXT,
+        agent_config        TEXT,
+        created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    -- Idempotent upgrade path for databases created before these columns existed.
+    ALTER TABLE ask_buddy_feedback
+        ADD COLUMN IF NOT EXISTS retrieved_chunk_ids INTEGER[],
+        ADD COLUMN IF NOT EXISTS is_refusal          BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS feedback_reason     TEXT,
+        ADD COLUMN IF NOT EXISTS agent_config        TEXT;
+
+    CREATE INDEX IF NOT EXISTS ask_buddy_feedback_response_idx
+        ON ask_buddy_feedback (response_id);
+    CREATE INDEX IF NOT EXISTS ask_buddy_feedback_feedback_idx
+        ON ask_buddy_feedback (feedback);
+    CREATE INDEX IF NOT EXISTS ask_buddy_feedback_refusal_idx
+        ON ask_buddy_feedback (is_refusal);
+"""
+
+
 def _dsn() -> str:
     dsn = os.environ.get("ASK_BUDDY_DB_DSN")
     if not dsn:
@@ -55,24 +96,8 @@ def init_schema() -> None:
     CREATE INDEX IF NOT EXISTS hr_chunks_fts_idx
         ON hr_chunks USING GIN (bm25_tsvector);
 
-    -- Feedback table: one row per thumbs-up / thumbs-down interaction
-    CREATE TABLE IF NOT EXISTS ask_buddy_feedback (
-        id              SERIAL PRIMARY KEY,
-        response_id     TEXT        NOT NULL UNIQUE,   -- uuid, ties buttons to a response
-        question        TEXT        NOT NULL,
-        answer_text     TEXT        NOT NULL,
-        sources_cited   TEXT        NOT NULL DEFAULT '',
-        feedback        TEXT        CHECK (feedback IN ('positive','negative')),
-        user_id         TEXT,                          -- Slack user ID who clicked
-        created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-
-    CREATE INDEX IF NOT EXISTS ask_buddy_feedback_response_idx
-        ON ask_buddy_feedback (response_id);
-
-    CREATE INDEX IF NOT EXISTS ask_buddy_feedback_feedback_idx
-        ON ask_buddy_feedback (feedback);
-
+    -- Feedback table: one row per posted answer (rated or not)
+    """ + _FEEDBACK_TABLE_DDL + """
     -- Tracks the content hash of each ingested source file so re-running
     -- the ingest pipeline can skip files that haven't changed.
     CREATE TABLE IF NOT EXISTS hr_ingested_files (
@@ -136,26 +161,50 @@ def delete_ingested_file_record(source_filename: str) -> None:
 
 
 def init_feedback_schema() -> None:
-    """Idempotent: create only the feedback table (safe to call at bot startup)."""
-    ddl = """
-    CREATE TABLE IF NOT EXISTS ask_buddy_feedback (
-        id              SERIAL PRIMARY KEY,
-        response_id     TEXT        NOT NULL UNIQUE,
-        question        TEXT        NOT NULL,
-        answer_text     TEXT        NOT NULL,
-        sources_cited   TEXT        NOT NULL DEFAULT '',
-        feedback        TEXT        CHECK (feedback IN ('positive','negative')),
-        user_id         TEXT,
-        created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-    CREATE INDEX IF NOT EXISTS ask_buddy_feedback_response_idx
-        ON ask_buddy_feedback (response_id);
-    CREATE INDEX IF NOT EXISTS ask_buddy_feedback_feedback_idx
-        ON ask_buddy_feedback (feedback);
+    """
+    Idempotent: create (and migrate) only the feedback table.
+    Safe to call at bot startup — runs the same ADD COLUMN IF NOT EXISTS
+    migration so an existing table gains the new columns automatically.
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(ddl)
+            cur.execute(_FEEDBACK_TABLE_DDL)
+
+
+def get_chunk_quality() -> dict[int, dict[str, int]]:
+    """
+    Return per-chunk feedback tallies keyed by hr_chunks.id:
+
+        {chunk_id: {"positive": int, "negative": int, "net": int}}
+
+    A chunk's counts sum the sentiment of every rated answer that cited it
+    (a chunk can appear in many answers). Used to bias retrieval ranking and
+    to surface low-quality source text for human review. Refusals are ignored
+    since they cite no chunks.
+    """
+    sql = """
+        SELECT chunk_id,
+               COUNT(*) FILTER (WHERE feedback = 'positive') AS positive,
+               COUNT(*) FILTER (WHERE feedback = 'negative') AS negative
+        FROM ask_buddy_feedback,
+             LATERAL unnest(retrieved_chunk_ids) AS chunk_id
+        WHERE feedback IS NOT NULL
+          AND retrieved_chunk_ids IS NOT NULL
+        GROUP BY chunk_id;
+    """
+    quality: dict[int, dict[str, int]] = {}
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            for r in cur.fetchall():
+                pos = int(r["positive"])
+                neg = int(r["negative"])
+                quality[int(r["chunk_id"])] = {
+                    "positive": pos,
+                    "negative": neg,
+                    "net": pos - neg,
+                }
+    return quality
 
 
 def clear_chunks() -> None:
