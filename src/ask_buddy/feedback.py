@@ -25,6 +25,15 @@ REFUSAL_TEXT = (
     "reach out to HR or your manager for help."
 )
 
+# Structured reasons offered in the 👎 modal. (value, label) pairs.
+NEGATIVE_REASONS: list[tuple[str, str]] = [
+    ("wrong_info", "The information was wrong or outdated"),
+    ("no_source", "No source / couldn't find the policy"),
+    ("off_topic", "Didn't answer what I asked"),
+    ("unclear", "Answer was confusing or unclear"),
+    ("other", "Something else"),
+]
+
 
 def is_refusal_text(answer_text: str) -> bool:
     """True when an answer is the canonical 'no results' refusal message."""
@@ -139,7 +148,7 @@ def store_feedback_row(
 ) -> None:
     """
     Insert a pending row into ask_buddy_feedback when the answer is posted.
-    feedback/user_id are NULL until the user clicks a button.
+    feedback/user_id/feedback_reason stay NULL until the user clicks a button.
     """
     sql = """
         INSERT INTO ask_buddy_feedback
@@ -164,16 +173,22 @@ def store_feedback_row(
             })
 
 
-def record_feedback(response_id: str, sentiment: str, user_id: str) -> str | None:
+def record_feedback(
+    response_id: str,
+    sentiment: str,
+    user_id: str,
+    reason: str | None = None,
+) -> str | None:
     """
-    Set feedback + user_id on an existing row.
+    Set feedback (+ optional reason) + user_id on an existing row.
     Returns the answer_text so the caller can rebuild the blocks,
-    or None if the response_id is not found.
+    or None if the response_id is not found OR was already rated.
     """
     sql = """
         UPDATE ask_buddy_feedback
-           SET feedback = %(sentiment)s,
-               user_id  = %(user_id)s
+           SET feedback        = %(sentiment)s,
+               feedback_reason = %(reason)s,
+               user_id         = %(user_id)s
          WHERE response_id = %(response_id)s
            AND feedback IS NULL          -- prevent double-click overwrites
         RETURNING answer_text;
@@ -182,11 +197,57 @@ def record_feedback(response_id: str, sentiment: str, user_id: str) -> str | Non
         with conn.cursor() as cur:
             cur.execute(sql, {
                 "sentiment": sentiment,
+                "reason": reason,
                 "user_id": user_id,
                 "response_id": response_id,
             })
             row = cur.fetchone()
     return dict(row)["answer_text"] if row else None
+
+
+# ---------------------------------------------------------------------------
+# 👎 reason modal
+# ---------------------------------------------------------------------------
+
+def build_reason_modal(response_id: str, channel: str, message_ts: str) -> dict[str, Any]:
+    """
+    Build a Slack modal asking *why* an answer was unhelpful.
+
+    The response_id, channel, and message_ts are stashed in private_metadata
+    so the view_submission handler can record the reason and update the
+    original message without any extra lookups.
+    """
+    options = [
+        {
+            "text": {"type": "plain_text", "text": label},
+            "value": value,
+        }
+        for value, label in NEGATIVE_REASONS
+    ]
+    return {
+        "type": "modal",
+        "callback_id": "feedback_reason_submit",
+        "private_metadata": json.dumps({
+            "response_id": response_id,
+            "channel": channel,
+            "message_ts": message_ts,
+        }),
+        "title": {"type": "plain_text", "text": "Quick feedback"},
+        "submit": {"type": "plain_text", "text": "Send"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": "reason_block",
+                "label": {"type": "plain_text", "text": "What was wrong?"},
+                "element": {
+                    "type": "radio_buttons",
+                    "action_id": "reason_choice",
+                    "options": options,
+                },
+            },
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------

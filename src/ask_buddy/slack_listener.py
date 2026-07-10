@@ -258,37 +258,41 @@ def handle_slash_command(ack, command, respond):
 # Feedback action handlers
 # ---------------------------------------------------------------------------
 
-def _handle_feedback(body: dict, ack, sentiment: str) -> None:
-    """Shared handler for both thumbs-up and thumbs-down actions."""
+def _parse_response_id(body: dict) -> str | None:
+    """Recover the response_id from a feedback button's JSON value payload."""
     import json
-    ack()   # acknowledge within 3 s to avoid Slack timeout
-
     action = body["actions"][0]
-    user_id = body["user"]["id"]
-    channel = body["channel"]["id"]
-    message_ts = body["message"]["ts"]
-
     try:
-        payload = json.loads(action["value"])
-        response_id = payload["response_id"]
+        return json.loads(action["value"])["response_id"]
     except (KeyError, json.JSONDecodeError):
         log.warning("[feedback] could not parse action value: %r", action.get("value"))
-        return
+        return None
 
-    # Save to DB
+
+def _record_and_update(
+    response_id: str,
+    sentiment: str,
+    user_id: str,
+    channel: str,
+    message_ts: str,
+    reason: str | None = None,
+) -> None:
+    """
+    Persist a rating and replace the message's buttons with a thank-you line.
+    Shared by the 👍 click and the 👎 modal submission.
+    """
     from .feedback import record_feedback, build_thankyou_blocks
-    answer_text = record_feedback(response_id, sentiment, user_id)
+    answer_text = record_feedback(response_id, sentiment, user_id, reason=reason)
 
     if answer_text is None:
-        # Already rated — silently ignore the duplicate click
-        log.info("[feedback] duplicate click ignored response_id=%s user=%s",
+        # Already rated — silently ignore the duplicate.
+        log.info("[feedback] duplicate rating ignored response_id=%s user=%s",
                  response_id, user_id)
         return
 
-    log.info("[feedback] recorded sentiment=%s response_id=%s user=%s",
-             sentiment, response_id, user_id)
+    log.info("[feedback] recorded sentiment=%s reason=%s response_id=%s user=%s",
+             sentiment, reason, response_id, user_id)
 
-    # Edit the original message: replace buttons with a thank-you line
     blocks = build_thankyou_blocks(answer_text, sentiment)
     try:
         app.client.chat_update(
@@ -304,12 +308,80 @@ def _handle_feedback(body: dict, ack, sentiment: str) -> None:
 
 @app.action("feedback_positive")
 def handle_feedback_positive(body, ack):
-    _handle_feedback(body, ack, "positive")
+    """👍 records immediately — no extra prompt needed for a good answer."""
+    ack()
+    response_id = _parse_response_id(body)
+    if response_id is None:
+        return
+    _record_and_update(
+        response_id,
+        sentiment="positive",
+        user_id=body["user"]["id"],
+        channel=body["channel"]["id"],
+        message_ts=body["message"]["ts"],
+    )
 
 
 @app.action("feedback_negative")
-def handle_feedback_negative(body, ack):
-    _handle_feedback(body, ack, "negative")
+def handle_feedback_negative(body, ack, client):
+    """
+    👎 opens a modal asking *why* before recording — the reason is far
+    richer signal than a bare thumbs-down. The row is only written on
+    modal submission (see handle_reason_submission).
+    """
+    ack()
+    response_id = _parse_response_id(body)
+    if response_id is None:
+        return
+
+    from .feedback import build_reason_modal
+    modal = build_reason_modal(
+        response_id=response_id,
+        channel=body["channel"]["id"],
+        message_ts=body["message"]["ts"],
+    )
+    try:
+        client.views_open(trigger_id=body["trigger_id"], view=modal)
+    except Exception:
+        # If the modal can't open (e.g. Interactivity misconfigured), fall
+        # back to recording the negative rating without a reason so the
+        # signal isn't lost.
+        log.warning("[feedback] could not open reason modal, recording bare 👎:\n%s",
+                    traceback.format_exc())
+        _record_and_update(
+            response_id,
+            sentiment="negative",
+            user_id=body["user"]["id"],
+            channel=body["channel"]["id"],
+            message_ts=body["message"]["ts"],
+        )
+
+
+@app.view("feedback_reason_submit")
+def handle_reason_submission(ack, body, view, logger):
+    """Record the 👎 rating together with the reason chosen in the modal."""
+    import json
+    ack()
+
+    try:
+        meta = json.loads(view["private_metadata"])
+        selected = (
+            view["state"]["values"]["reason_block"]["reason_choice"]["selected_option"]
+        )
+        reason = selected["value"] if selected else None
+    except (KeyError, json.JSONDecodeError, TypeError):
+        log.warning("[feedback] could not parse modal submission:\n%s",
+                    traceback.format_exc())
+        return
+
+    _record_and_update(
+        meta["response_id"],
+        sentiment="negative",
+        user_id=body["user"]["id"],
+        channel=meta["channel"],
+        message_ts=meta["message_ts"],
+        reason=reason,
+    )
 
 
 # ---------------------------------------------------------------------------
