@@ -126,6 +126,32 @@ class TestRRFMerge:
         merged = _rrf_merge([row], [], top_k=1)
         assert merged[0]["effective_date"] == "2024-01-01"
 
+    def test_quality_reranking_promotes_liked_chunk(self):
+        """A chunk with strong positive feedback should outrank a tied chunk."""
+        from src.ask_buddy.retrieve import _rrf_merge
+        # Two docs at identical RRF rank; doc 2 has +6 net feedback.
+        vec = [self._make_row(1), self._make_row(2)]
+        kw = [self._make_row(1), self._make_row(2)]
+        quality = {2: {"positive": 6, "negative": 0, "net": 6}}
+        merged = _rrf_merge(vec, kw, top_k=2, quality=quality)
+        assert merged[0]["id"] == 2, "Positively-rated chunk should be promoted"
+        assert merged[0]["quality_net"] == 6
+
+    def test_quality_reranking_demotes_disliked_chunk(self):
+        from src.ask_buddy.retrieve import _rrf_merge
+        vec = [self._make_row(1), self._make_row(2)]
+        kw = [self._make_row(1), self._make_row(2)]
+        quality = {1: {"positive": 0, "negative": 6, "net": -6}}
+        merged = _rrf_merge(vec, kw, top_k=2, quality=quality)
+        assert merged[0]["id"] == 2, "Negatively-rated chunk should be demoted"
+
+    def test_quality_multiplier_is_bounded(self):
+        from src.ask_buddy.retrieve import _quality_multiplier, QUALITY_MAX
+        # A huge pile-on can't exceed the ±MAX ceiling.
+        assert _quality_multiplier(1000) == 1.0 + QUALITY_MAX
+        assert _quality_multiplier(-1000) == 1.0 - QUALITY_MAX
+        assert _quality_multiplier(0) == 1.0
+
 
 # ---------------------------------------------------------------------------
 # TC-2: Integration — single-doc clear answer with citation

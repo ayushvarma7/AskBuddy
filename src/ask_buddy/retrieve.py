@@ -19,12 +19,18 @@ import psycopg2.extras
 from langchain_core.tools import tool
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
-from .db import get_conn
+from .db import get_conn, get_chunk_quality
 
 EMBED_MODEL = "models/gemini-embedding-001"
 RRF_K = 60          # standard constant in RRF: score = 1 / (K + rank)
 VECTOR_POOL = 20    # candidates fetched from vector search before RRF merge
 BM25_POOL = 20      # candidates fetched from keyword search before RRF merge
+
+# Feedback-informed re-ranking: each net thumbs vote a chunk has accumulated
+# nudges its merged score by QUALITY_ALPHA, clamped to ±QUALITY_MAX so a
+# pile-on can't bury an otherwise-relevant chunk or float an irrelevant one.
+QUALITY_ALPHA = 0.05   # ±5% per net vote
+QUALITY_MAX = 0.30     # ±30% ceiling
 
 
 def _embed_query(query: str) -> list[float]:
@@ -81,16 +87,27 @@ def _keyword_search(query: str, pool: int) -> list[dict]:
             return [dict(r) for r in cur.fetchall()]
 
 
+def _quality_multiplier(net_votes: int) -> float:
+    """Map a chunk's net feedback votes to a bounded score multiplier."""
+    adjustment = max(-QUALITY_MAX, min(QUALITY_MAX, net_votes * QUALITY_ALPHA))
+    return 1.0 + adjustment
+
+
 def _rrf_merge(
     vector_results: list[dict],
     keyword_results: list[dict],
     top_k: int,
-    prefer_latest: bool = True,
+    quality: dict[int, dict[str, int]] | None = None,
 ) -> list[dict]:
     """
-    Merge two ranked lists via Reciprocal Rank Fusion.
+    Merge two ranked lists via Reciprocal Rank Fusion, then optionally
+    re-weight by accumulated user feedback.
 
-    score(doc) = Σ  1 / (K + rank_i)   for each list the doc appears in
+    score(doc)   = Σ  1 / (K + rank_i)   for each list the doc appears in
+    adjusted(doc) = score(doc) * (1 + clamp(net_votes * ALPHA, ±MAX))
+
+    `quality` maps chunk_id -> {"net": int, ...} (see db.get_chunk_quality).
+    When omitted, this is plain RRF — keeping the function pure and testable.
     """
     scores: dict[int, float] = {}
     by_id: dict[int, dict] = {}
@@ -105,21 +122,27 @@ def _rrf_merge(
         scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (RRF_K + rank)
         by_id[doc_id] = row
 
-    merged = sorted(scores.keys(), key=lambda doc_id: scores[doc_id], reverse=True)
+    # Apply feedback-informed re-weighting to the merged scores.
+    adjusted: dict[int, float] = {}
+    for doc_id, base in scores.items():
+        net = (quality or {}).get(doc_id, {}).get("net", 0)
+        adjusted[doc_id] = base * _quality_multiplier(net)
+
+    merged = sorted(adjusted.keys(), key=lambda doc_id: adjusted[doc_id], reverse=True)
 
     results = []
     for doc_id in merged[:top_k]:
         row = dict(by_id[doc_id])
         row["rrf_score"] = round(scores[doc_id], 6)
+        net = (quality or {}).get(doc_id, {}).get("net", 0)
+        if net:
+            # Surface the feedback adjustment for transparency/debugging.
+            row["quality_net"] = net
+            row["adjusted_score"] = round(adjusted[doc_id], 6)
         # Stringify effective_date for JSON serialisation
         if isinstance(row.get("effective_date"), date):
             row["effective_date"] = row["effective_date"].isoformat()
         results.append(row)
-
-    if prefer_latest and results:
-        # Boost results from the most recent effective_date for ambiguous queries
-        # (no re-sorting — just a signal the agent can use via the returned dates)
-        pass  # Dates are already in the returned metadata; agent reasons over them.
 
     return results
 
@@ -148,7 +171,15 @@ def hybrid_retrieve(query: str, top_k: int = 5) -> list[dict[str, Any]]:
         embedding = _embed_query(query)
         vector_results = _vector_search(embedding, pool=VECTOR_POOL)
         keyword_results = _keyword_search(query, pool=BM25_POOL)
-        merged = _rrf_merge(vector_results, keyword_results, top_k=top_k)
+        # Feedback-informed re-ranking. If the feedback table is unavailable
+        # for any reason, degrade gracefully to plain RRF rather than failing
+        # the whole retrieval.
+        try:
+            quality = get_chunk_quality()
+        except Exception:
+            quality = None
+        merged = _rrf_merge(vector_results, keyword_results, top_k=top_k,
+                            quality=quality)
     except Exception as exc:
         # Surface errors clearly to the agent rather than silently returning []
         return [{"error": str(exc)}]
