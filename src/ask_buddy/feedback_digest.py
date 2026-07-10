@@ -38,6 +38,8 @@ def _collect(days: int) -> dict:
             cur.execute(
                 """
                 SELECT
+                    now()                                                    AS window_end,
+                    now() - (%(days)s || ' days')::interval                  AS window_start,
                     COUNT(*) FILTER (WHERE feedback IS NOT NULL)            AS rated,
                     COUNT(*) FILTER (WHERE feedback = 'negative')           AS negative,
                     COUNT(*) FILTER (WHERE is_refusal AND feedback='negative') AS doc_gaps
@@ -73,6 +75,8 @@ def _collect(days: int) -> dict:
             wrong_answers = [dict(r) for r in cur.fetchall()]
 
     return {
+        "window_start": totals["window_start"],
+        "window_end": totals["window_end"],
         "rated": totals["rated"] or 0,
         "negative": totals["negative"] or 0,
         "doc_gaps": totals["doc_gaps"] or 0,
@@ -82,10 +86,20 @@ def _collect(days: int) -> dict:
     }
 
 
+def _format_date_range(start, end) -> str:
+    """e.g. 'Jul 3 – Jul 10, 2026' (or 'Jul 3 – 10, 2026' when same month)."""
+    if start.year == end.year and start.month == end.month:
+        return f"{start.strftime('%b %-d')}–{end.strftime('%-d, %Y')}"
+    if start.year == end.year:
+        return f"{start.strftime('%b %-d')} – {end.strftime('%b %-d, %Y')}"
+    return f"{start.strftime('%b %-d, %Y')} – {end.strftime('%b %-d, %Y')}"
+
+
 def _format_blocks(d: dict, days: int) -> list[dict]:
     rated = d["rated"]
     neg = d["negative"]
     pct = (neg / rated * 100) if rated else 0
+    date_range = _format_date_range(d["window_start"], d["window_end"])
 
     def _lines(rows, empty):
         if not rows:
@@ -97,7 +111,7 @@ def _format_blocks(d: dict, days: int) -> list[dict]:
          "text": {"type": "plain_text", "text": "📋 Ask Buddy — weekly feedback digest"}},
         {"type": "section",
          "text": {"type": "mrkdwn",
-                  "text": (f"*Last {days} days*\n"
+                  "text": (f"*{date_range}* ({days} days)\n"
                            f"• Rated answers: *{rated}*\n"
                            f"• Negative: *{neg}* ({pct:.0f}%)\n"
                            f"• Doc gaps (refused but wanted): *{d['doc_gaps']}*")}},
@@ -105,11 +119,11 @@ def _format_blocks(d: dict, days: int) -> list[dict]:
         {"type": "section",
          "text": {"type": "mrkdwn",
                   "text": "*🕳️ Doc gaps — HR topics we couldn't answer:*\n"
-                          + _lines(d["doc_gap_questions"], "none this week")}},
+                          + _lines(d["doc_gap_questions"], "none in this window")}},
         {"type": "section",
          "text": {"type": "mrkdwn",
                   "text": "*👎 Answers marked wrong/unclear:*\n"
-                          + _lines(d["wrong_answers"], "none this week")}},
+                          + _lines(d["wrong_answers"], "none in this window")}},
     ]
 
     if d["review_chunks"]:
@@ -130,8 +144,9 @@ def _format_blocks(d: dict, days: int) -> list[dict]:
 def run_digest(days: int = 7, dry_run: bool = False) -> None:
     data = _collect(days)
     blocks = _format_blocks(data, days)
-    fallback = (f"Ask Buddy weekly digest: {data['negative']} negative, "
-                f"{data['doc_gaps']} doc gaps in the last {days} days.")
+    date_range = _format_date_range(data["window_start"], data["window_end"])
+    fallback = (f"Ask Buddy weekly digest ({date_range}): {data['negative']} negative, "
+                f"{data['doc_gaps']} doc gaps.")
 
     if dry_run:
         import json
