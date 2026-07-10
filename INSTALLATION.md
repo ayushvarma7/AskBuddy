@@ -391,6 +391,25 @@ Output:
 Use the negatively-rated questions to identify gaps in the HR corpus and add
 or improve those document sections, then re-ingest.
 
+### Weekly digest to Slack (optional)
+
+Instead of running the report by hand, post a weekly negative-feedback +
+doc-gap digest to a Slack channel. Set `ASK_BUDDY_DIGEST_CHANNEL` in `.env`
+to the target channel id, then:
+
+```bash
+# Preview without posting:
+uv run python -m src.ask_buddy.feedback_digest --dry-run
+
+# Post to the configured channel:
+uv run python -m src.ask_buddy.feedback_digest
+```
+
+Schedule it with cron (Mondays 09:00 shown) — the bot itself does not schedule it:
+```cron
+0 9 * * 1  cd /path/to/AskBuddy && uv run python -m src.ask_buddy.feedback_digest
+```
+
 ---
 
 ## 12. Stopping and Restarting
@@ -545,6 +564,7 @@ meeting-scribe/
 │   ├── agent.py                 CugaAgent + system prompt
 │   ├── feedback.py              Block Kit builder, DB feedback helpers
 │   ├── feedback_report.py       Analytics CLI
+│   ├── feedback_digest.py       Weekly digest → Slack channel
 │   └── slack_listener.py        Slack Bolt Socket Mode listener
 │
 ├── tests/
