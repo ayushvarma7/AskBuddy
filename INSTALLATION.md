@@ -74,7 +74,9 @@ installs everything including `cuga`, `langchain-google-genai`,
 ## 3. Create the Slack App
 
 You need **admin access** (or permission to install apps) on your Slack
-workspace.
+workspace. This section walks through it step by step; for a condensed
+reference (just the scope table, tokens, and a troubleshooting checklist),
+see **[SLACK_PERMISSIONS.md](SLACK_PERMISSIONS.md)**.
 
 ### 3a — Create the app
 

@@ -64,22 +64,11 @@ docker compose -f docker-compose.askbuddy.yml ps
 
 ### Step 3 — Create your Slack App
 
-1. Go to **<https://api.slack.com/apps>** → **Create New App** →
-   **From scratch** → Name it **"Ask Buddy"**, pick your workspace.
-2. **OAuth & Permissions** → **Bot Token Scopes** — add:
-   - `chat:write`
-   - `im:history`
-   - `im:read`
-   - `im:write`
-   - `users:read`
-   - `channels:history` *(if you want @mention in channels)*
-   - `app_mentions:read` *(same)*
-3. **Install to Workspace** → copy the **Bot User OAuth Token** (`xoxb-…`).
-4. **Socket Mode** → Enable Socket Mode → Generate an **App-Level Token**
-   with the `connections:write` scope → copy it (`xapp-…`).
-5. **Event Subscriptions** → Enable Events → Subscribe to **Bot Events**:
-   - `message.im`
-   - `app_mention` *(optional, for channel @mentions)*
+See **[SLACK_PERMISSIONS.md](SLACK_PERMISSIONS.md)** for the complete,
+up-to-date walkthrough: which Bot Token Scopes to add, Socket Mode + the
+App-Level Token, Event Subscriptions, Interactivity (needed for the feedback
+buttons and the 👎 reason modal), and registering the `/askbuddy` slash
+command — plus a troubleshooting table for the most common permission errors.
 
 ### Step 4 — Configure environment variables
 
