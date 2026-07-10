@@ -388,8 +388,27 @@ Output:
   ...
 ```
 
-Use the negatively-rated questions to identify gaps in the HR corpus and add
-or improve those document sections, then re-ingest.
+The report now also breaks out:
+- **Refusals** — how many "No results found" answers were 👎'd (users wanted
+  an answer). These are your strongest doc-gap signals.
+- **👎 reasons** — the category each thumbs-down came with (from the modal:
+  wrong info / no source / off-topic / unclear / other).
+- **Content-review queue** — chunks that accumulated 3+ thumbs-down across the
+  answers that cited them; the underlying HR text may be wrong or ambiguous.
+- **Negative rate by agent config** — a built-in A/B view if you run different
+  model configs (see the per-node model split in README_ASKBUDDY.md).
+
+Optional flags:
+```bash
+# Cluster negatively-rated questions by meaning (uses the embedder):
+uv run python -m src.ask_buddy.feedback_report --cluster
+
+# Export negatively-rated questions as regression eval candidates:
+uv run python -m src.ask_buddy.feedback_report --export-evals tests/regression_evals.json
+```
+After exporting, fill in `expected_sources` for questions that *should* be
+answerable, commit the file, and `TestFeedbackRegressionEvals` will assert
+retrieval keeps surfacing those sources so a future change can't silently regress.
 
 ### Weekly digest to Slack (optional)
 
@@ -409,6 +428,15 @@ Schedule it with cron (Mondays 09:00 shown) — the bot itself does not schedule
 ```cron
 0 9 * * 1  cd /path/to/AskBuddy && uv run python -m src.ask_buddy.feedback_digest
 ```
+
+> **Note on the 👎 modal:** thumbs-down now opens a short "what was wrong?"
+> modal before recording. This needs **Interactivity** enabled in the Slack app
+> (already required for feedback buttons — no new scope). If Interactivity is
+> off, the bot falls back to recording a bare thumbs-down.
+
+> **Schema note:** the new feedback columns are added automatically on bot
+> startup via an idempotent migration — no manual SQL needed when upgrading an
+> existing database.
 
 ---
 
@@ -562,10 +590,10 @@ meeting-scribe/
 │   ├── ingest.py                Chunk → embed → store pipeline
 │   ├── retrieve.py              hybrid_retrieve tool (vector + FTS + RRF)
 │   ├── agent.py                 CugaAgent + system prompt
-│   ├── feedback.py              Block Kit builder, DB feedback helpers
-│   ├── feedback_report.py       Analytics CLI
+│   ├── feedback.py              Block Kit builder, 👎 modal, DB feedback helpers
+│   ├── feedback_report.py       Analytics CLI (refusals, reasons, clustering, evals)
 │   ├── feedback_digest.py       Weekly digest → Slack channel
-│   └── slack_listener.py        Slack Bolt Socket Mode listener
+│   └── slack_listener.py        Slack Bolt Socket Mode listener (+ /askbuddy, modal)
 │
 ├── tests/
 │   ├── conftest.py              Loads .env before test collection
