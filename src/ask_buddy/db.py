@@ -49,6 +49,32 @@ _FEEDBACK_TABLE_DDL = """
 """
 
 
+# ---------------------------------------------------------------------------
+# Reminders table DDL (broadcast reminders scheduled via scheduler.py)
+# ---------------------------------------------------------------------------
+#
+# cron_expression : standard 5-field cron syntax (minute hour day month dow),
+#                   evaluated in `timezone`. Recurring by design — a reminder
+#                   fires every time the cron schedule matches.
+# active          : FALSE once cancelled; kept for history instead of deleted.
+_REMINDERS_TABLE_DDL = """
+    CREATE TABLE IF NOT EXISTS ask_buddy_reminders (
+        id              SERIAL PRIMARY KEY,
+        channel_id      TEXT        NOT NULL,
+        channel_name    TEXT,
+        message         TEXT        NOT NULL,
+        cron_expression TEXT        NOT NULL,
+        timezone        TEXT        NOT NULL DEFAULT 'America/Los_Angeles',
+        created_by      TEXT,
+        active          BOOLEAN     NOT NULL DEFAULT TRUE,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS ask_buddy_reminders_active_idx
+        ON ask_buddy_reminders (active);
+"""
+
+
 def _dsn() -> str:
     dsn = os.environ.get("ASK_BUDDY_DB_DSN")
     if not dsn:
@@ -83,11 +109,15 @@ def init_schema() -> None:
         source_filename  TEXT        NOT NULL,
         section          TEXT        NOT NULL DEFAULT '',
         chunk_text       TEXT        NOT NULL,
-        embedding        vector(768),            -- Google gemini-embedding-001 truncated to 768
+        embedding        vector(768),
         effective_date   DATE,
+        corpus           TEXT        NOT NULL DEFAULT 'hr',
         bm25_tsvector    tsvector
             GENERATED ALWAYS AS (to_tsvector('english', chunk_text)) STORED
     );
+
+    ALTER TABLE hr_chunks
+        ADD COLUMN IF NOT EXISTS corpus TEXT NOT NULL DEFAULT 'hr';
 
     CREATE INDEX IF NOT EXISTS hr_chunks_embedding_idx
         ON hr_chunks USING hnsw (embedding vector_cosine_ops)
@@ -96,16 +126,40 @@ def init_schema() -> None:
     CREATE INDEX IF NOT EXISTS hr_chunks_fts_idx
         ON hr_chunks USING GIN (bm25_tsvector);
 
+    CREATE INDEX IF NOT EXISTS hr_chunks_corpus_idx
+        ON hr_chunks (corpus);
+
     -- Feedback table: one row per posted answer (rated or not)
     """ + _FEEDBACK_TABLE_DDL + """
     -- Tracks the content hash of each ingested source file so re-running
     -- the ingest pipeline can skip files that haven't changed.
     CREATE TABLE IF NOT EXISTS hr_ingested_files (
-        source_filename  TEXT        PRIMARY KEY,
+        source_filename  TEXT        NOT NULL,
+        corpus           TEXT        NOT NULL DEFAULT 'hr',
         content_hash     TEXT        NOT NULL,
         chunk_count      INTEGER     NOT NULL,
-        ingested_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+        ingested_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (source_filename, corpus)
     );
+
+    ALTER TABLE hr_ingested_files
+        ADD COLUMN IF NOT EXISTS corpus TEXT NOT NULL DEFAULT 'hr';
+    -- Migrate from old single-column PK to composite PK (idempotent).
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = 'hr_ingested_files_pkey'
+              AND conrelid = 'hr_ingested_files'::regclass
+              AND array_length(conkey, 1) > 1
+        ) THEN
+            ALTER TABLE hr_ingested_files DROP CONSTRAINT IF EXISTS hr_ingested_files_pkey;
+            ALTER TABLE hr_ingested_files ADD PRIMARY KEY (source_filename, corpus);
+        END IF;
+    END $$;
+
+    -- Broadcast reminders scheduled via the in-process scheduler
+    """ + _REMINDERS_TABLE_DDL + """
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -113,20 +167,31 @@ def init_schema() -> None:
     print("Schema initialised.")
 
 
-def get_ingested_hashes() -> dict[str, str]:
-    """Return {source_filename: content_hash} for all previously ingested files."""
+def init_reminders_schema() -> None:
+    """Idempotent: create just the reminders table. Safe to call at bot startup."""
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT source_filename, content_hash FROM hr_ingested_files;")
+            cur.execute(_REMINDERS_TABLE_DDL)
+
+
+def get_ingested_hashes(corpus: str = "hr") -> dict[str, str]:
+    """Return {source_filename: content_hash} for previously ingested files in a corpus."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT source_filename, content_hash FROM hr_ingested_files WHERE corpus = %s;",
+                (corpus,),
+            )
             return {r["source_filename"]: r["content_hash"] for r in cur.fetchall()}
 
 
-def upsert_ingested_file(source_filename: str, content_hash: str, chunk_count: int) -> None:
+def upsert_ingested_file(source_filename: str, content_hash: str, chunk_count: int,
+                         corpus: str = "hr") -> None:
     """Record (or update) the content hash + chunk count for a source file."""
     sql = """
-        INSERT INTO hr_ingested_files (source_filename, content_hash, chunk_count, ingested_at)
-        VALUES (%(source_filename)s, %(content_hash)s, %(chunk_count)s, now())
-        ON CONFLICT (source_filename) DO UPDATE
+        INSERT INTO hr_ingested_files (source_filename, corpus, content_hash, chunk_count, ingested_at)
+        VALUES (%(source_filename)s, %(corpus)s, %(content_hash)s, %(chunk_count)s, now())
+        ON CONFLICT (source_filename, corpus) DO UPDATE
             SET content_hash = EXCLUDED.content_hash,
                 chunk_count  = EXCLUDED.chunk_count,
                 ingested_at  = now();
@@ -135,28 +200,29 @@ def upsert_ingested_file(source_filename: str, content_hash: str, chunk_count: i
         with conn.cursor() as cur:
             cur.execute(sql, {
                 "source_filename": source_filename,
+                "corpus": corpus,
                 "content_hash": content_hash,
                 "chunk_count": chunk_count,
             })
 
 
-def delete_chunks_for_file(source_filename: str) -> None:
-    """Remove all hr_chunks rows for a given source file (used before re-ingesting it)."""
+def delete_chunks_for_file(source_filename: str, corpus: str = "hr") -> None:
+    """Remove all hr_chunks rows for a given source file in a corpus."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "DELETE FROM hr_chunks WHERE source_filename = %s;",
-                (source_filename,),
+                "DELETE FROM hr_chunks WHERE source_filename = %s AND corpus = %s;",
+                (source_filename, corpus),
             )
 
 
-def delete_ingested_file_record(source_filename: str) -> None:
-    """Remove the tracking row for a source file (used when the file was deleted)."""
+def delete_ingested_file_record(source_filename: str, corpus: str = "hr") -> None:
+    """Remove the tracking row for a source file in a corpus."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "DELETE FROM hr_ingested_files WHERE source_filename = %s;",
-                (source_filename,),
+                "DELETE FROM hr_ingested_files WHERE source_filename = %s AND corpus = %s;",
+                (source_filename, corpus),
             )
 
 
@@ -290,9 +356,80 @@ def get_negative_feedback_rows(since_days: int | None = None) -> list[dict]:
             return [dict(r) for r in cur.fetchall()]
 
 
-def clear_chunks() -> None:
-    """Truncate the hr_chunks table (used before a full re-ingest)."""
+def clear_chunks(corpus: str | None = None) -> None:
+    """Clear chunks, optionally scoped to a single corpus."""
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("TRUNCATE TABLE hr_chunks RESTART IDENTITY;")
-    print("hr_chunks table cleared.")
+            if corpus:
+                cur.execute("DELETE FROM hr_chunks WHERE corpus = %s;", (corpus,))
+                print(f"hr_chunks cleared for corpus '{corpus}'.")
+            else:
+                cur.execute("TRUNCATE TABLE hr_chunks RESTART IDENTITY;")
+                print("hr_chunks table cleared.")
+
+
+# ---------------------------------------------------------------------------
+# Reminders
+# ---------------------------------------------------------------------------
+
+def insert_reminder(channel_id: str, channel_name: str, message: str,
+                    cron_expression: str, timezone: str,
+                    created_by: str | None = None) -> int:
+    """Insert a new active reminder and return its id."""
+    sql = """
+        INSERT INTO ask_buddy_reminders
+            (channel_id, channel_name, message, cron_expression, timezone, created_by)
+        VALUES (%(channel_id)s, %(channel_name)s, %(message)s,
+                %(cron_expression)s, %(timezone)s, %(created_by)s)
+        RETURNING id;
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, {
+                "channel_id": channel_id,
+                "channel_name": channel_name,
+                "message": message,
+                "cron_expression": cron_expression,
+                "timezone": timezone,
+                "created_by": created_by,
+            })
+            return cur.fetchone()["id"]
+
+
+def get_active_reminders() -> list[dict]:
+    """Return all active reminders (used to reload the scheduler on boot)."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, channel_id, channel_name, message, cron_expression, "
+                "timezone, created_by, created_at "
+                "FROM ask_buddy_reminders WHERE active = TRUE ORDER BY id;"
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+def list_reminders_for_channel(channel_id: str | None = None) -> list[dict]:
+    """Return active reminders, optionally scoped to one channel."""
+    sql = ("SELECT id, channel_id, channel_name, message, cron_expression, "
+           "timezone, created_by, created_at FROM ask_buddy_reminders "
+           "WHERE active = TRUE")
+    params: dict = {}
+    if channel_id:
+        sql += " AND channel_id = %(channel_id)s"
+        params["channel_id"] = channel_id
+    sql += " ORDER BY id;"
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
+
+
+def deactivate_reminder(reminder_id: int) -> bool:
+    """Mark a reminder inactive. Returns True if a row was updated."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE ask_buddy_reminders SET active = FALSE WHERE id = %s AND active = TRUE;",
+                (reminder_id,),
+            )
+            return cur.rowcount > 0
