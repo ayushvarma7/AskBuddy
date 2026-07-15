@@ -148,6 +148,43 @@ After changing scopes, Slack requires a reinstall:
 
 ---
 
+## 3.5 (Optional) Configure the Git Agent
+
+Skip this step if you don't need GitHub issue/PR Q&A or proactive triage.
+
+### Create a fine-grained PAT (read-only)
+
+1. GitHub → **Settings → Developer settings → Personal access tokens →
+   Fine-grained tokens → Generate new token**.
+2. **Token name:** `askbuddy-git-agent`. **Expiration:** 90 days.
+3. **Resource owner:** the org/user that owns the repos Ask Buddy will read.
+4. **Repository access:** *Only select repositories* → pick the repos to expose.
+5. **Permissions** (Repository permissions — set each to **Read-only**):
+   - **Metadata** → Read-only *(mandatory)*
+   - **Issues** → Read-only
+   - **Pull requests** → Read-only
+   - **Commit statuses / Checks** → Read-only *(needed for CI check status)*
+6. Generate, copy the token (starts with `github_pat_...`).
+
+### Add to `.env`
+
+```dotenv
+GITHUB_TOKEN=github_pat_...
+# Optional — proactive triage:
+GIT_WATCH_REPOS=your-org/your-repo
+GIT_WATCH_CHANNEL=eng-triage
+GIT_WATCH_INTERVAL_MINUTES=5
+```
+
+If `GITHUB_TOKEN` is unset, the git agents return a clear "GitHub is not
+configured" message and the watcher does not start — no errors, just
+graceful degradation.
+
+> **Triage channel:** invite Ask Buddy to the channel first:
+> `/invite @Ask Buddy` in `#eng-triage` (or wherever you set `GIT_WATCH_CHANNEL`).
+
+---
+
 ## 4. Get a Google API Key
 
 Ask Buddy uses **Google Gemini** for both embeddings and the LLM.
@@ -350,6 +387,118 @@ Expected: answer drawing on both `parental_leave.md` and
 > **"What were the PTO accrual rates before 2024?"**
 
 Expected: answer from the archived v1.0 section with `effective 2022-06-01` cited.
+
+---
+
+### Test 5 — Git Agent: list open issues
+
+> **"List open issues in owner/repo"**
+> *(replace `owner/repo` with your actual repo, e.g. `ayushvarma/wca4z-benchmarking-driver`)*
+
+Expected response (routed to `git_issue_agent`):
+```
+Here are the open issues in ayushvarma/wca4z-benchmarking-driver:
+
+• #5 Benchmark run hangs when MCP server returns unsupported protocol version — open
+• #4 Add p50/p95/p99 latency percentiles to transform benchmark report — open
+• #3 PaginatedMetadataCacheService TTL not configurable per benchmark run — open
+
+(URLs included for each issue)
+```
+
+If you see `"GitHub is not configured"` — `GITHUB_TOKEN` is missing or wrong.
+If you see `"Not found"` — the repo name is wrong or the PAT doesn't cover it.
+
+---
+
+### Test 6 — Git Agent: summarize a specific issue
+
+> **"Summarize issue #3 in owner/repo"**
+
+Expected: title, state (open/closed), author, labels, assignees, and a 1–2
+sentence summary of the issue body, plus the GitHub URL. No fabricated details
+— only what GitHub returned.
+
+---
+
+### Test 7 — Git Agent: list open PRs
+
+> **"What pull requests are open in owner/repo?"**
+
+Expected response (routed to `git_pr_agent`):
+```
+Open pull requests in ayushvarma/wca4z-benchmarking-driver:
+
+• #2 Add configurable TTL support for PaginatedMetadataCacheService — by ayushvarma
+• #1 Fix: driver timeout on MCP protocol version mismatch — by ayushvarma (draft)
+```
+
+---
+
+### Test 8 — Git Agent: PR readiness check
+
+> **"Is PR #2 ready to merge in owner/repo?"**
+
+Expected: the agent calls three tools in sequence — `get_pull_request`
+(draft flag + mergeable state), `get_pr_reviews` (who approved / requested
+changes), and `get_pr_checks` (CI pass/fail/pending) — then summarises:
+
+```
+PR #2 "Add configurable TTL support for PaginatedMetadataCacheService"
+
+• Author: ayushvarma → base: main ← head: feat/ttl-config
+• Draft: No  |  Mergeable state: clean
+• Reviews: 1 approved (alice), 0 requesting changes
+• CI checks: 3 passed / 0 failed / 0 pending
+
+✅ Looks ready to merge.
+```
+
+---
+
+### Test 9 — Git Agent: search issues across repos
+
+> **"Search for open issues labelled bug in owner/repo"**
+> *(GitHub search syntax: `repo:owner/repo is:open label:bug`)*
+
+Expected: list of matching issues with number, title, author, and URL.
+The agent passes your natural-language request through as a GitHub search query.
+
+---
+
+### Test 10 — Git Agent: read-only refusal
+
+> **"Close issue #3 in owner/repo"**
+
+Expected: the agent explains it cannot do that — Ask Buddy's git access is
+read-only. No action is taken. This verifies the system prompt guardrail works.
+
+```
+Ask Buddy's GitHub access is read-only. I can't close, edit, or comment on
+issues — I can only list and summarize them. To close this issue, go directly
+to GitHub: <issue URL>
+```
+
+---
+
+### Test 11 — Proactive triage (if GIT_WATCH_REPOS is set)
+
+1. Open a new issue on your watched repo directly on GitHub.
+2. Wait one poll interval (`GIT_WATCH_INTERVAL_MINUTES`, default 5 minutes).
+3. Check your `GIT_WATCH_CHANNEL` Slack channel.
+
+Expected: a summary message appears automatically — no DM or prompt needed:
+```
+🔍 *New activity in `owner/repo`*
+
+*Issues (1):*
+• #6 My new test issue — by ayushvarma <https://github.com/...>
+```
+
+If nothing appears after two intervals:
+- Confirm the bot is in the channel (`/invite @Ask Buddy`)
+- Check bot logs for `[git_watch]` lines
+- Check `GIT_WATCH_CHANNEL` exactly matches the channel name (no `#` prefix)
 
 ---
 

@@ -15,13 +15,18 @@ Slack Bolt (Socket Mode)
       ▼
 CugaSupervisor ──── routes by topic
       │
-      ├── hr_agent  ──── hr_retrieve  (corpus='hr')
-      │                       │
-      └── it_agent  ──── it_retrieve  (corpus='it')
-                              │
-                       hr_chunks table (pgvector/pg16)
-                       (corpus column scopes retrieval)
-                              │
+      ├── hr_agent        ──── hr_retrieve  (corpus='hr')
+      ├── it_agent        ──── it_retrieve  (corpus='it')
+      ├── scheduler_agent ──── APScheduler reminders
+      ├── git_issue_agent ──── GitHub Issues (read-only)
+      └── git_pr_agent    ──── GitHub PRs + CI checks (read-only)
+                                 │
+                          GitHub REST API (api.github.com)
+                          Fine-grained PAT, read-only scopes
+
+Background polling:
+  APScheduler ──every N min──▶ git_watch.poll_once ──▶ Slack triage channel
+
 post_slack_message  ──▶  Slack
 ```
 
@@ -288,7 +293,52 @@ about a past version.
 
 ---
 
-## 5. File Structure
+## 5. Git Agent (Read-Only GitHub Integration)
+
+Ask Buddy can answer questions about GitHub issues and pull requests and
+proactively post new-item summaries to a triage Slack channel.
+
+### What it answers
+
+- *"List open issues in acme/backend"*
+- *"Summarize issue #42 in acme/frontend"*
+- *"Is PR #17 ready to merge in acme/backend?"* (draft flag + review
+  verdicts + CI check results)
+- *"What PRs are waiting for review in acme/frontend?"*
+
+All access is **read-only**. Ask Buddy cannot create, close, comment on,
+merge, or approve anything — enforced both by the PAT's read-only scopes
+and by the absence of write tools in the agents.
+
+### Proactive triage
+
+When `GIT_WATCH_REPOS` and `GIT_WATCH_CHANNEL` are set, Ask Buddy polls
+each repo every `GIT_WATCH_INTERVAL_MINUTES` (default: 5) and posts a
+short summary of **new** issues/PRs to the configured Slack channel.
+On the first poll, watermarks are seeded silently (no backlog dump).
+
+### New environment variables
+
+```dotenv
+# Fine-grained PAT, read-only scopes (Issues/PRs/Metadata/Checks).
+GITHUB_TOKEN=github_pat_...
+
+# Base API URL. Leave as-is for github.com; change only for GitHub Enterprise.
+GITHUB_API_URL=https://api.github.com
+
+# Proactive triage: comma-separated "owner/repo" list. Empty = triage off.
+GIT_WATCH_REPOS=acme-corp/backend,acme-corp/frontend
+
+# Slack channel (name or ID) for triage summaries.
+GIT_WATCH_CHANNEL=eng-triage
+
+# Poll interval in minutes.
+GIT_WATCH_INTERVAL_MINUTES=5
+```
+
+---
+
+## 6. File Structure
 
 ```
 .
@@ -298,10 +348,12 @@ about a past version.
 ├── docker-compose.askbuddy.yml   pgvector/pg16 container
 ├── src/ask_buddy/
 │   ├── __init__.py
-│   ├── db.py                     schema init, connection helper
+│   ├── db.py                     schema init, connection helper + git-watch table
 │   ├── ingest.py                 corpus-aware chunking + embedding
 │   ├── retrieve.py               hr_retrieve, it_retrieve @tools (vector+FTS+RRF)
-│   ├── agent.py                  CugaSupervisor + domain sub-agents
+│   ├── agent.py                  CugaSupervisor + domain sub-agents (incl. git agents)
+│   ├── github_client.py          thin read-only GitHub REST v3 client
+│   ├── git_watch.py              proactive triage watcher (APScheduler polling)
 │   ├── feedback.py               Block Kit feedback buttons + modals
 │   ├── feedback_report.py        analytics CLI (clustering, evals)
 │   ├── feedback_digest.py        weekly Slack digest

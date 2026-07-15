@@ -140,6 +140,66 @@ find one.
 
 ---
 
+## 9. Git Agent setup (no reinstall needed)
+
+The Git Agent requires **no new Slack scopes** and **no Slack app reinstall**.
+Everything it needs (`chat:write`) was already granted for the base bot.
+
+The only Slack-side action required is inviting the bot to your triage channel:
+
+### 9.1 Create the triage channel (if it doesn't exist)
+In Slack, create any channel you want — e.g. `#github-alerts`, `#eng-triage`,
+`#repo-watch`. The name is up to you; just match it in `GIT_WATCH_CHANNEL`.
+
+### 9.2 Invite Ask Buddy into the channel
+In the new channel, type:
+```
+/invite @Ask Buddy
+```
+This is **required** — without it `chat_postMessage` will fail for that channel.
+
+> `chat:write.public` (already granted in section 2) lets the bot post to
+> public channels it hasn't been invited to. If your triage channel is
+> **public**, the invite is optional but still recommended. If it is
+> **private**, the invite is mandatory.
+
+### 9.3 Add GitHub env vars to `.env`
+```dotenv
+# Fine-grained PAT — read-only scopes: Metadata, Issues, Pull requests, Checks
+GITHUB_TOKEN=github_pat_...
+
+GIT_WATCH_REPOS=your-username/your-repo   # comma-separate multiple repos
+GIT_WATCH_CHANNEL=github-alerts           # must match your channel name
+GIT_WATCH_INTERVAL_MINUTES=5
+```
+
+### 9.4 Restart the bot
+```bash
+uv run python -m src.ask_buddy.slack_listener
+```
+
+Confirm these two log lines appear:
+```
+ask_buddy_git_watch table ready.
+[git_watch] started: repos=[...] channel=github-alerts every 5 min
+```
+
+If you see `[git_watch] GITHUB_TOKEN unset — triage watcher disabled.` instead,
+the token wasn't picked up — check the `.env` file and restart again.
+
+### 9.5 Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `triage watcher disabled` in logs | `GITHUB_TOKEN`, `GIT_WATCH_REPOS`, or `GIT_WATCH_CHANNEL` missing from `.env` |
+| Triage posts never arrive in channel | Bot not invited to the channel — run `/invite @Ask Buddy` |
+| Git Q&A works but no triage posts | `GIT_WATCH_REPOS` or `GIT_WATCH_CHANNEL` not set (Q&A works without them) |
+| "GitHub auth/permission error" | PAT scopes missing — check Issues + Pull requests + Metadata are Read-only |
+| "Not found" on a repo | PAT's repository access doesn't include that repo — regenerate with the correct repo selected |
+| First poll posts nothing | Expected — first poll seeds watermarks silently; new items appear on the next poll |
+
+---
+
 ## Summary checklist
 
 - [ ] All 9 Bot Token Scopes added (section 2)
@@ -149,3 +209,6 @@ find one.
 - [ ] Interactivity enabled
 - [ ] `/askbuddy` slash command created
 - [ ] `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` set in `.env`
+- [ ] *(Git Agent)* Triage channel created + `/invite @Ask Buddy` sent
+- [ ] *(Git Agent)* `GITHUB_TOKEN` + `GIT_WATCH_*` vars added to `.env`
+- [ ] *(Git Agent)* Bot restarted — confirmed `git_watch started` in logs
