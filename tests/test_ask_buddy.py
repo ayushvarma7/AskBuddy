@@ -126,6 +126,12 @@ class TestRRFMerge:
         merged = _rrf_merge([row], [], top_k=1)
         assert merged[0]["effective_date"] == "2024-01-01"
 
+    def test_corpus_scoped_retrieve_exists(self):
+        """hr_retrieve and it_retrieve are importable @tools."""
+        from src.ask_buddy.retrieve import hr_retrieve, it_retrieve
+        assert callable(hr_retrieve.invoke)
+        assert callable(it_retrieve.invoke)
+
     def test_quality_reranking_promotes_liked_chunk(self):
         """A chunk with strong positive feedback should outrank a tied chunk."""
         from src.ask_buddy.retrieve import _rrf_merge
@@ -154,6 +160,78 @@ class TestRRFMerge:
 
 
 # ---------------------------------------------------------------------------
+# TC-1b: Offline — supervisor builder smoke test
+# ---------------------------------------------------------------------------
+
+class TestSupervisorBuilder:
+    def test_build_supervisor_returns_supervisor(self):
+        from cuga import CugaSupervisor
+        from src.ask_buddy.agent import build_supervisor
+        sup = build_supervisor(slack_post_fn=lambda ch, txt: None)
+        assert isinstance(sup, CugaSupervisor)
+
+    def test_build_supervisor_has_both_agents(self):
+        from src.ask_buddy.agent import build_supervisor
+        sup = build_supervisor(slack_post_fn=lambda ch, txt: None)
+        assert "hr_agent" in sup._agents
+        assert "it_agent" in sup._agents
+        assert "scheduler_agent" in sup._agents
+
+
+# ---------------------------------------------------------------------------
+# TC-1c: Offline — reminder scheduling (create/list/cancel + DB round-trip)
+# ---------------------------------------------------------------------------
+
+class TestReminderTools:
+    def _fake_resolve(self, channel: str):
+        name = channel.lstrip("#")
+        return f"C_FAKE_{name.upper()}", name
+
+    def test_build_scheduler_agent(self):
+        from src.ask_buddy.agent import build_scheduler_agent
+        agent = build_scheduler_agent(
+            slack_post_fn=lambda ch, txt: None,
+            resolve_channel_fn=self._fake_resolve,
+            created_by="U_TEST",
+        )
+        assert agent is not None
+
+    @integration
+    def test_create_reminder_tool_persists_and_schedules(self):
+        from src.ask_buddy.agent import _build_reminder_tools
+        from src.ask_buddy.db import deactivate_reminder, list_reminders_for_channel
+        from src.ask_buddy.scheduler import start_scheduler, unschedule_reminder
+
+        start_scheduler(slack_post_fn=lambda ch, txt: None)
+        create_reminder, list_reminders, cancel_reminder = _build_reminder_tools(
+            self._fake_resolve, created_by="U_TEST"
+        )
+
+        result = create_reminder.invoke({
+            "channel": "test-reminders-channel",
+            "message": "unit test reminder",
+            "cron_expression": "0 9 * * *",
+            "timezone": "America/Los_Angeles",
+        })
+        assert result["channel_name"] == "test-reminders-channel"
+        assert result["cron_expression"] == "0 9 * * *"
+        reminder_id = result["id"]
+
+        rows = list_reminders_for_channel("C_FAKE_TEST-REMINDERS-CHANNEL")
+        assert any(r["id"] == reminder_id for r in rows)
+
+        cancel_msg = cancel_reminder.invoke({"reminder_id": reminder_id})
+        assert "cancelled" in cancel_msg.lower()
+
+        rows_after = list_reminders_for_channel("C_FAKE_TEST-REMINDERS-CHANNEL")
+        assert not any(r["id"] == reminder_id for r in rows_after)
+
+        # Cleanup safety net in case the assertion above fails first.
+        deactivate_reminder(reminder_id)
+        unschedule_reminder(reminder_id)
+
+
+# ---------------------------------------------------------------------------
 # TC-2: Integration — single-doc clear answer with citation
 # ---------------------------------------------------------------------------
 
@@ -161,8 +239,8 @@ class TestRRFMerge:
 class TestSingleDocRetrieval:
     def test_pto_query_returns_pto_doc(self):
         """TC-2a: Clear single-doc question returns PTO policy with citation."""
-        from src.ask_buddy.retrieve import hybrid_retrieve
-        results = hybrid_retrieve.invoke(
+        from src.ask_buddy.retrieve import hr_retrieve
+        results = hr_retrieve.invoke(
             {"query": "How many days of PTO do I get after 3 years?", "top_k": 5}
         )
         assert results, "Should return at least one result"
@@ -173,8 +251,8 @@ class TestSingleDocRetrieval:
 
     def test_remote_work_query_returns_remote_doc(self):
         """Clear question about remote work eligibility."""
-        from src.ask_buddy.retrieve import hybrid_retrieve
-        results = hybrid_retrieve.invoke(
+        from src.ask_buddy.retrieve import hr_retrieve
+        results = hr_retrieve.invoke(
             {"query": "Who is eligible for hybrid remote work?", "top_k": 5}
         )
         sources = {r["source_filename"] for r in results if "error" not in r}
@@ -193,8 +271,8 @@ class TestCrossDocRetrieval:
         A query about adding a dependent after parental leave should surface
         chunks from both documents.
         """
-        from src.ask_buddy.retrieve import hybrid_retrieve
-        results = hybrid_retrieve.invoke(
+        from src.ask_buddy.retrieve import hr_retrieve
+        results = hr_retrieve.invoke(
             {
                 "query": (
                     "How do I enroll my newborn in health insurance "
@@ -217,8 +295,8 @@ class TestCrossDocRetrieval:
 class TestDateSpecificQuery:
     def test_current_pto_is_v2(self):
         """TC-4a: Query for current PTO accrual should surface v2.0 (2024-01-01)."""
-        from src.ask_buddy.retrieve import hybrid_retrieve
-        results = hybrid_retrieve.invoke(
+        from src.ask_buddy.retrieve import hr_retrieve
+        results = hr_retrieve.invoke(
             {"query": "What is the current PTO accrual rate?", "top_k": 5}
         )
         top = [r for r in results if "error" not in r]
@@ -231,8 +309,8 @@ class TestDateSpecificQuery:
 
     def test_old_pto_version_retrievable(self):
         """TC-4b: Asking explicitly about the old policy should retrieve v1.0 text."""
-        from src.ask_buddy.retrieve import hybrid_retrieve
-        results = hybrid_retrieve.invoke(
+        from src.ask_buddy.retrieve import hr_retrieve
+        results = hr_retrieve.invoke(
             {
                 "query": "What was the PTO policy before 2024? How many days in 2022?",
                 "top_k": 8,
@@ -261,8 +339,8 @@ class TestOutOfScopeRefusal:
         The important thing is that it_security_policy.md is NOT in the DB —
         the agent-level refusal is handled by the system prompt scope check.
         """
-        from src.ask_buddy.retrieve import hybrid_retrieve
-        results = hybrid_retrieve.invoke(
+        from src.ask_buddy.retrieve import hr_retrieve
+        results = hr_retrieve.invoke(
             {
                 "query": (
                     "What is the password rotation policy and VPN requirements?"
@@ -383,8 +461,8 @@ def _load_curated_evals() -> list[dict]:
 class TestFeedbackRegressionEvals:
     @pytest.mark.parametrize("case", _load_curated_evals())
     def test_expected_source_is_retrieved(self, case):
-        from src.ask_buddy.retrieve import hybrid_retrieve
-        results = hybrid_retrieve.invoke({"query": case["question"], "top_k": 8})
+        from src.ask_buddy.retrieve import hr_retrieve
+        results = hr_retrieve.invoke({"query": case["question"], "top_k": 8})
         got = {r.get("source_filename") for r in results if "error" not in r}
         expected = set(case["expected_sources"])
         assert got & expected, (
