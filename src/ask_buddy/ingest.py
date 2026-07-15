@@ -2,10 +2,13 @@
 Ingestion pipeline for Ask Buddy.
 
 Usage:
-    python -m src.ask_buddy.ingest [--docs-dir PATH] [--clear]
+    python -m src.ask_buddy.ingest [--docs-dir PATH] [--corpus NAME] [--clear]
 
 Reads all *.md files under docs-dir, chunks them, embeds them with
-Google text-embedding-004, and upserts into Postgres/pgvector.
+Google gemini-embedding-001, and upserts into Postgres/pgvector.
+
+Each chunk is tagged with a corpus name (default "hr") so multiple
+document domains (HR, IT, …) share one table with scoped retrieval.
 
 Incremental by default: each file's content hash is tracked in
 hr_ingested_files, so a plain re-run skips files that haven't changed,
@@ -44,7 +47,9 @@ load_dotenv()
 # Config
 # ---------------------------------------------------------------------------
 
-DOCS_DIR = Path(__file__).resolve().parents[2] / "data" / "hr_docs" / "synthetic"
+HR_DOCS_DIR = Path(__file__).resolve().parents[2] / "data" / "hr_docs" / "synthetic"
+IT_DOCS_DIR = Path(__file__).resolve().parents[2] / "data" / "it_docs"
+DOCS_DIR = HR_DOCS_DIR
 CHUNK_TOKENS_TARGET = 500          # rough token target per chunk
 CHUNK_OVERLAP_CHARS = 200          # character overlap between adjacent chunks
 EMBED_MODEL = "models/gemini-embedding-001"
@@ -153,10 +158,10 @@ def _embed_batch(embedder: GoogleGenerativeAIEmbeddings, texts: list[str]) -> li
 def _insert_chunks(rows: list[dict]) -> None:
     sql = """
         INSERT INTO hr_chunks
-            (source_filename, section, chunk_text, embedding, effective_date)
+            (source_filename, section, chunk_text, embedding, effective_date, corpus)
         VALUES
             (%(source_filename)s, %(section)s, %(chunk_text)s,
-             %(embedding)s::vector, %(effective_date)s)
+             %(embedding)s::vector, %(effective_date)s, %(corpus)s)
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -171,28 +176,24 @@ def _file_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def ingest_docs(docs_dir: Path, clear: bool = False) -> None:
+def ingest_docs(docs_dir: Path, clear: bool = False, corpus: str = "hr") -> None:
     init_schema()
     if clear:
-        clear_chunks()
+        clear_chunks(corpus=corpus)
 
     md_files = sorted(docs_dir.glob("*.md"))
     if not md_files:
         print(f"No markdown files found in {docs_dir}", file=sys.stderr)
         sys.exit(1)
 
-    # --clear wipes hr_chunks but hr_ingested_files rows may still reference
-    # filenames that no longer match — force every file to look "new" so it
-    # gets reprocessed and the hash tracking table gets refreshed.
-    previous_hashes = {} if clear else get_ingested_hashes()
+    previous_hashes = {} if clear else get_ingested_hashes(corpus=corpus)
 
     on_disk_filenames = {md_path.name for md_path in md_files}
 
-    # Clean up tracking + chunks for files that were removed from docs_dir.
     for stale_filename in set(previous_hashes) - on_disk_filenames:
         print(f"  {stale_filename}: removed from {docs_dir}, deleting its chunks")
-        delete_chunks_for_file(stale_filename)
-        delete_ingested_file_record(stale_filename)
+        delete_chunks_for_file(stale_filename, corpus=corpus)
+        delete_ingested_file_record(stale_filename, corpus=corpus)
 
     files_to_process: list[tuple[Path, str]] = []
     skipped = 0
@@ -229,15 +230,16 @@ def ingest_docs(docs_dir: Path, clear: bool = False) -> None:
                     "source_filename": md_path.name,
                     "section": section_heading,
                     "chunk_text": chunk,
-                    "embedding": None,          # filled in next step
+                    "embedding": None,
                     "effective_date": effective_date,
+                    "corpus": corpus,
                 })
 
         # A previously-ingested file that changed must have its old chunks
         # removed before the new ones are inserted, or stale + fresh chunks
         # would both be retrievable at once.
         if md_path.name in previous_hashes:
-            delete_chunks_for_file(md_path.name)
+            delete_chunks_for_file(md_path.name, corpus=corpus)
 
         chunk_counts[md_path.name] = len(file_rows)
         file_hashes[md_path.name] = content_hash
@@ -258,7 +260,8 @@ def ingest_docs(docs_dir: Path, clear: bool = False) -> None:
     _insert_chunks(all_rows)
 
     for filename, content_hash in file_hashes.items():
-        upsert_ingested_file(filename, content_hash, chunk_counts[filename])
+        upsert_ingested_file(filename, content_hash, chunk_counts[filename],
+                             corpus=corpus)
 
     print(
         f"Done. {len(all_rows)} chunks stored across {len(files_to_process)} file(s) "
@@ -267,24 +270,33 @@ def ingest_docs(docs_dir: Path, clear: bool = False) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Ingest HR docs into pgvector")
+    parser = argparse.ArgumentParser(description="Ingest docs into pgvector")
     parser.add_argument(
         "--docs-dir",
         type=Path,
-        default=DOCS_DIR,
-        help="Directory containing *.md HR policy files",
+        default=None,
+        help="Directory containing *.md files (default: auto from --corpus)",
+    )
+    parser.add_argument(
+        "--corpus",
+        type=str,
+        default="hr",
+        help="Corpus tag stored on each chunk (hr, it, …). Default: hr",
     )
     parser.add_argument(
         "--clear",
         action="store_true",
         help=(
-            "Truncate all chunks and force a full re-embed of every file, "
-            "ignoring content hashes. Without this flag, files whose content "
-            "hasn't changed since the last run are skipped."
+            "Delete all chunks for this corpus and force a full re-embed, "
+            "ignoring content hashes. Without this flag, unchanged files "
+            "are skipped."
         ),
     )
     args = parser.parse_args()
-    ingest_docs(args.docs_dir, clear=args.clear)
+    if args.docs_dir is None:
+        defaults = {"hr": HR_DOCS_DIR, "it": IT_DOCS_DIR}
+        args.docs_dir = defaults.get(args.corpus, HR_DOCS_DIR)
+    ingest_docs(args.docs_dir, clear=args.clear, corpus=args.corpus)
 
 
 if __name__ == "__main__":
