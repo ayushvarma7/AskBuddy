@@ -21,8 +21,8 @@ from .db import get_conn
 # questions. Kept here as the single source of truth so the listener,
 # feedback tagging, and reporting all agree on what counts as a refusal.
 REFUSAL_TEXT = (
-    "No results found in our HR documents for that question — please "
-    "reach out to HR or your manager for help."
+    "No results found in our documents for that question — please "
+    "reach out to the appropriate team for help."
 )
 
 # Structured reasons offered in the 👎 modal. (value, label) pairs.
@@ -36,8 +36,9 @@ NEGATIVE_REASONS: list[tuple[str, str]] = [
 
 
 def is_refusal_text(answer_text: str) -> bool:
-    """True when an answer is the canonical 'no results' refusal message."""
-    return answer_text.strip() == REFUSAL_TEXT.strip()
+    """True when an answer is a 'no results' refusal message."""
+    normalized = answer_text.strip().lower()
+    return "no results found" in normalized and "reach out" in normalized
 
 
 # ---------------------------------------------------------------------------
