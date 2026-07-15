@@ -469,3 +469,208 @@ class TestFeedbackRegressionEvals:
             f"Regression: {case['question']!r} should surface one of "
             f"{expected}; retrieval returned {got}"
         )
+
+
+# ---------------------------------------------------------------------------
+# TC-GIT-1 through TC-GIT-8: GitHub client + git_watch offline unit tests
+# ---------------------------------------------------------------------------
+
+class TestGitHubClientTrimsIssue:
+    def test_trim_issue_keys(self):
+        """_trim_issue extracts only the expected fields."""
+        from src.ask_buddy.github_client import _trim_issue
+        raw = {
+            "number": 42, "title": "Bug", "state": "open",
+            "user": {"login": "alice"}, "labels": [{"name": "bug"}],
+            "assignees": [{"login": "bob"}], "comments": 3,
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-02T00:00:00Z",
+            "html_url": "https://github.com/a/b/issues/42",
+        }
+        trimmed = _trim_issue(raw)
+        assert trimmed["number"] == 42
+        assert trimmed["author"] == "alice"
+        assert trimmed["labels"] == ["bug"]
+        assert trimmed["assignees"] == ["bob"]
+        assert "url" in trimmed
+        assert "body" not in trimmed  # body only in get_issue, not list view
+
+    def test_list_issues_filters_out_prs(self, monkeypatch):
+        """list_issues must exclude items that have a 'pull_request' key."""
+        import src.ask_buddy.github_client as gh
+        fake_data = [
+            {"number": 1, "title": "Issue", "state": "open",
+             "user": {"login": "u"}, "labels": [], "assignees": [],
+             "comments": 0, "created_at": None, "updated_at": None,
+             "html_url": "https://example.com/1"},
+            {"number": 2, "title": "PR disguised as issue", "state": "open",
+             "pull_request": {"url": "..."},
+             "user": {"login": "u"}, "labels": [], "assignees": [],
+             "comments": 0, "created_at": None, "updated_at": None,
+             "html_url": "https://example.com/2"},
+        ]
+        monkeypatch.setattr(gh, "_request", lambda path, params=None: fake_data)
+        result = gh.list_issues("a/b")
+        assert len(result) == 1
+        assert result[0]["number"] == 1
+
+
+class TestGitHubClientSplitRepo:
+    def test_valid_repo(self):
+        from src.ask_buddy.github_client import _split_repo
+        assert _split_repo("owner/name") == ("owner", "name")
+
+    def test_invalid_repo_raises(self):
+        from src.ask_buddy.github_client import _split_repo, GitHubError
+        with pytest.raises(GitHubError):
+            _split_repo("badrepo")
+
+
+class TestGitHubClientMissingToken:
+    def test_missing_token_raises(self, monkeypatch):
+        """list_issues must surface GitHubError when GITHUB_TOKEN is unset."""
+        import src.ask_buddy.github_client as gh
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        with pytest.raises(gh.GitHubError, match="GITHUB_TOKEN"):
+            gh.list_issues("a/b")
+
+
+class TestGitPrChecksCount:
+    def test_check_run_counts(self, monkeypatch):
+        import src.ask_buddy.github_client as gh
+        calls = iter([
+            {"head": {"sha": "abc"}},   # get_pull_request (pulls/{n})
+            {"check_runs": [            # check-runs
+                {"name": "unit",  "status": "completed",   "conclusion": "success"},
+                {"name": "lint",  "status": "completed",   "conclusion": "failure"},
+                {"name": "e2e",   "status": "in_progress", "conclusion": None},
+            ]},
+        ])
+        monkeypatch.setattr(gh, "_request", lambda path, params=None: next(calls))
+        out = gh.get_pr_checks("a/b", 1)
+        assert out["total"] == 3
+        assert out["success"] == 1
+        assert out["failure"] == 1
+        assert out["pending"] == 1
+        assert len(out["runs"]) == 3
+
+
+class TestGitToolsReturnErrorDict:
+    def test_list_issues_tool_returns_error_dict(self, monkeypatch):
+        """When gh.list_issues raises GitHubError, the @tool returns [{'error':...}]."""
+        import src.ask_buddy.github_client as gh
+        import src.ask_buddy.agent as agent_mod
+
+        def _raise(*a, **kw):
+            raise gh.GitHubError("no token")
+
+        monkeypatch.setattr(gh, "list_issues", _raise)
+        list_issues_tool, _, _ = agent_mod._build_git_issue_tools()
+        result = list_issues_tool.invoke({"repo": "a/b", "state": "open"})
+        assert isinstance(result, list)
+        assert result[0].get("error")
+
+
+class TestGitWatchFirstSightSeedsNoPost:
+    def test_first_sight_seeds_silently(self, monkeypatch):
+        import src.ask_buddy.git_watch as gw
+        import src.ask_buddy.github_client as gh
+
+        monkeypatch.setenv("GIT_WATCH_CHANNEL", "eng-triage")
+        monkeypatch.setattr(gh, "list_issues",
+                            lambda *a, **kw: [{"number": 5, "title": "T",
+                                               "state": "open", "author": "u",
+                                               "labels": [], "assignees": [],
+                                               "comments": 0, "created_at": None,
+                                               "updated_at": None, "url": "http://x"}])
+        monkeypatch.setattr(gh, "list_pull_requests",
+                            lambda *a, **kw: [{"number": 3, "title": "P",
+                                               "state": "open", "draft": False,
+                                               "author": "u", "labels": [],
+                                               "requested_reviewers": [],
+                                               "base": "main", "head": "feat",
+                                               "head_sha": "abc",
+                                               "mergeable_state": None,
+                                               "created_at": None, "updated_at": None,
+                                               "url": "http://y"}])
+        # Return 0/0 to simulate first sight
+        monkeypatch.setattr(gw, "get_git_watermark",
+                            lambda repo: {"last_issue_number": 0, "last_pr_number": 0})
+
+        watermark_calls = []
+        monkeypatch.setattr(gw, "set_git_watermark",
+                            lambda repo, iss, pr: watermark_calls.append((repo, iss, pr)))
+
+        post_calls = []
+        gw.poll_once("a/b", lambda ch, txt: post_calls.append(txt))
+
+        assert len(watermark_calls) == 1, "Should seed the watermark"
+        assert len(post_calls) == 0, "Should NOT post on first sight"
+
+
+class TestGitWatchReportsOnlyNew:
+    def test_reports_only_items_above_watermark(self, monkeypatch):
+        import src.ask_buddy.git_watch as gw
+        import src.ask_buddy.github_client as gh
+
+        monkeypatch.setenv("GIT_WATCH_CHANNEL", "eng-triage")
+
+        def _issue(n):
+            return {"number": n, "title": f"Issue {n}", "state": "open",
+                    "author": "u", "labels": [], "assignees": [], "comments": 0,
+                    "created_at": None, "updated_at": None, "url": f"http://i/{n}"}
+
+        def _pr(n):
+            return {"number": n, "title": f"PR {n}", "state": "open",
+                    "draft": False, "author": "u", "labels": [],
+                    "requested_reviewers": [], "base": "main", "head": "feat",
+                    "head_sha": "abc", "mergeable_state": None,
+                    "created_at": None, "updated_at": None, "url": f"http://p/{n}"}
+
+        monkeypatch.setattr(gh, "list_issues",
+                            lambda *a, **kw: [_issue(4), _issue(6), _issue(7)])
+        monkeypatch.setattr(gh, "list_pull_requests",
+                            lambda *a, **kw: [_pr(3), _pr(4)])
+
+        # Watermark: issue=5, pr=3  →  new: issues 6&7, PR 4
+        monkeypatch.setattr(gw, "get_git_watermark",
+                            lambda repo: {"last_issue_number": 5, "last_pr_number": 3})
+
+        watermark_args = []
+        monkeypatch.setattr(gw, "set_git_watermark",
+                            lambda repo, iss, pr: watermark_args.append((iss, pr)))
+
+        posted: list[str] = []
+        gw.poll_once("a/b", lambda ch, txt: posted.append(txt))
+
+        assert len(posted) == 1, "Should post exactly once"
+        summary = posted[0]
+        assert "#6" in summary
+        assert "#7" in summary
+        assert "PR 4" in summary or "#4" in summary
+        assert "#4 Issue 4" not in summary  # issue #4 is below watermark
+        assert "PR 3" not in summary and "#3" not in summary  # pr #3 at watermark
+
+        # Watermark should advance to max seen (issue 7, pr 4)
+        assert watermark_args[0] == (7, 4)
+
+
+class TestSupervisorRegistersGitSlaves:
+    def test_git_agents_in_supervisor(self):
+        """build_supervisor must include git_issue_agent and git_pr_agent."""
+        from src.ask_buddy.agent import build_supervisor
+        sup = build_supervisor(slack_post_fn=lambda ch, txt: None)
+        assert "git_issue_agent" in sup._agents
+        assert "git_pr_agent" in sup._agents
+
+    def test_build_git_issue_agent_returns_cuga_agent(self):
+        from cuga import CugaAgent
+        from src.ask_buddy.agent import build_git_issue_agent
+        agent = build_git_issue_agent(slack_post_fn=lambda ch, txt: None)
+        assert isinstance(agent, CugaAgent)
+
+    def test_build_git_pr_agent_returns_cuga_agent(self):
+        from cuga import CugaAgent
+        from src.ask_buddy.agent import build_git_pr_agent
+        agent = build_git_pr_agent(slack_post_fn=lambda ch, txt: None)
+        assert isinstance(agent, CugaAgent)
