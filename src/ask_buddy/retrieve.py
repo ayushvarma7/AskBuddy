@@ -45,9 +45,11 @@ def _embed_query(query: str) -> list[float]:
     return embedder.embed_query(query)
 
 
-def _vector_search(embedding: list[float], pool: int) -> list[dict]:
+def _vector_search(embedding: list[float], pool: int,
+                    corpus: str | None = None) -> list[dict]:
     """Return up to `pool` chunks ordered by cosine similarity."""
-    sql = """
+    where = "WHERE corpus = %s" if corpus else ""
+    sql = f"""
         SELECT
             id,
             source_filename,
@@ -56,19 +58,23 @@ def _vector_search(embedding: list[float], pool: int) -> list[dict]:
             effective_date,
             1 - (embedding <=> %s::vector) AS score
         FROM hr_chunks
+        {where}
         ORDER BY embedding <=> %s::vector
         LIMIT %s;
     """
     emb_str = "[" + ",".join(str(v) for v in embedding) + "]"
+    params: tuple = (emb_str, emb_str, pool) if not corpus else (emb_str, corpus, emb_str, pool)
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, (emb_str, emb_str, pool))
+            cur.execute(sql, params)
             return [dict(r) for r in cur.fetchall()]
 
 
-def _keyword_search(query: str, pool: int) -> list[dict]:
+def _keyword_search(query: str, pool: int,
+                    corpus: str | None = None) -> list[dict]:
     """Return up to `pool` chunks ordered by Postgres full-text rank."""
-    sql = """
+    corpus_filter = "AND corpus = %s" if corpus else ""
+    sql = f"""
         SELECT
             id,
             source_filename,
@@ -78,12 +84,14 @@ def _keyword_search(query: str, pool: int) -> list[dict]:
             ts_rank_cd(bm25_tsvector, query) AS score
         FROM hr_chunks, plainto_tsquery('english', %s) query
         WHERE bm25_tsvector @@ query
+        {corpus_filter}
         ORDER BY score DESC
         LIMIT %s;
     """
+    params: tuple = (query, pool) if not corpus else (query, corpus, pool)
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, (query, pool))
+            cur.execute(sql, params)
             return [dict(r) for r in cur.fetchall()]
 
 
@@ -147,6 +155,24 @@ def _rrf_merge(
     return results
 
 
+def _hybrid_retrieve_core(query: str, top_k: int = 5,
+                          corpus: str | None = None) -> list[dict[str, Any]]:
+    """Shared retrieval logic, optionally scoped to a corpus."""
+    try:
+        embedding = _embed_query(query)
+        vector_results = _vector_search(embedding, pool=VECTOR_POOL, corpus=corpus)
+        keyword_results = _keyword_search(query, pool=BM25_POOL, corpus=corpus)
+        try:
+            quality = get_chunk_quality()
+        except Exception:
+            quality = None
+        merged = _rrf_merge(vector_results, keyword_results, top_k=top_k,
+                            quality=quality)
+    except Exception as exc:
+        return [{"error": str(exc)}]
+    return merged
+
+
 @tool
 def hybrid_retrieve(query: str, top_k: int = 5) -> list[dict[str, Any]]:
     """
@@ -167,21 +193,31 @@ def hybrid_retrieve(query: str, top_k: int = 5) -> list[dict[str, Any]]:
     question, call this tool once more with a reformulated query before
     concluding no results are available.
     """
-    try:
-        embedding = _embed_query(query)
-        vector_results = _vector_search(embedding, pool=VECTOR_POOL)
-        keyword_results = _keyword_search(query, pool=BM25_POOL)
-        # Feedback-informed re-ranking. If the feedback table is unavailable
-        # for any reason, degrade gracefully to plain RRF rather than failing
-        # the whole retrieval.
-        try:
-            quality = get_chunk_quality()
-        except Exception:
-            quality = None
-        merged = _rrf_merge(vector_results, keyword_results, top_k=top_k,
-                            quality=quality)
-    except Exception as exc:
-        # Surface errors clearly to the agent rather than silently returning []
-        return [{"error": str(exc)}]
+    return _hybrid_retrieve_core(query, top_k, corpus="hr")
 
-    return merged
+
+@tool
+def hr_retrieve(query: str, top_k: int = 5) -> list[dict[str, Any]]:
+    """
+    Retrieve HR policy chunks (PTO, benefits, leave, expenses, conduct,
+    performance reviews, remote work) for `query`.
+
+    Returns a list of dicts with chunk_text, source_filename, section,
+    effective_date, and rrf_score. Always cite source_filename, section,
+    and effective_date in your answer.
+    """
+    return _hybrid_retrieve_core(query, top_k, corpus="hr")
+
+
+@tool
+def it_retrieve(query: str, top_k: int = 5) -> list[dict[str, Any]]:
+    """
+    Retrieve IT security and infrastructure policy chunks (passwords,
+    VPN, MFA, device management, data classification, acceptable use)
+    for `query`.
+
+    Returns a list of dicts with chunk_text, source_filename, section,
+    effective_date, and rrf_score. Always cite source_filename, section,
+    and effective_date in your answer.
+    """
+    return _hybrid_retrieve_core(query, top_k, corpus="it")
