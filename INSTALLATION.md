@@ -226,51 +226,33 @@ If it shows `(health: starting)` wait a few more seconds and run again.
 
 ---
 
-## 7. Ingest the HR Documents
+## 7. Ingest the Document Corpora
 
-This step chunks the 8 synthetic HR policy files, generates embeddings
-with Google's `gemini-embedding-001` model, and stores everything in
-Postgres. It takes about 2–3 minutes and costs a few API calls.
+Ask Buddy supports multiple document corpora (HR, IT, …). Each corpus
+is ingested separately and tagged so retrieval stays scoped.
+
+### 7a — Ingest HR documents
 
 ```bash
 uv run python -m src.ask_buddy.ingest --clear
 ```
 
-Expected output:
-```
-Schema initialised.
-hr_chunks table cleared.
-  benefits_enrollment.md: 11 sections, effective_date=2023-11-01
-  code_of_conduct.md: 8 sections, effective_date=2023-06-01
-  expense_reimbursement.md: 9 sections, effective_date=2023-04-01
-  it_security_policy.md: 10 sections, effective_date=2024-01-15
-  parental_leave.md: 9 sections, effective_date=2024-03-01
-  performance_reviews.md: 8 sections, effective_date=2023-01-01
-  pto_policy.md: 7 sections, effective_date=2024-01-01
-  remote_work_policy.md: 8 sections, effective_date=2023-09-01
+This chunks the 7 HR policy files under `data/hr_docs/synthetic/`, embeds
+them with `gemini-embedding-001`, and stores them tagged as `corpus='hr'`.
 
-Embedding 70 chunks in batches of 32…
-  embedded 32/70
-  embedded 64/70
-  embedded 70/70
-Inserting into database…
-Done. 70 chunks stored.
-```
-
-After ingestion, delete the IT security policy chunks (they are included for
-testing but should not be in the live HR corpus):
+### 7b — Ingest IT documents
 
 ```bash
-docker exec askbuddy_postgres psql -U askbuddy -d askbuddy \
-  -c "DELETE FROM hr_chunks WHERE source_filename = 'it_security_policy.md';"
+uv run python -m src.ask_buddy.ingest --corpus it --clear
 ```
 
-Confirm 60 chunks remain:
+This chunks `data/it_docs/it_security_policy.md` and stores chunks tagged
+as `corpus='it'`. The IT agent will only search this corpus.
 
-```bash
-docker exec askbuddy_postgres psql -U askbuddy -d askbuddy \
-  -c "SELECT source_filename, COUNT(*) FROM hr_chunks GROUP BY 1 ORDER BY 1;"
-```
+`--clear` only wipes the targeted corpus — HR chunks are untouched when
+you re-ingest IT, and vice versa.
+
+Override the directory for any corpus with `--docs-dir PATH`.
 
 ---
 
@@ -339,17 +321,22 @@ Was this helpful?   [👍 Helpful]  [👎 Not helpful]
 
 Click 👍 — the buttons should be replaced with `✅ Thanks for the feedback!`
 
-### Test 2 — Out-of-scope question (should refuse)
+### Test 2 — IT security question (supervisor routes to IT agent)
 
 > **"What is the company's password rotation policy and VPN requirements?"**
 
-Expected response:
+Expected response (routed to `it_agent`):
 ```
-No results found in our HR documents for that question — please reach out
-to HR or your manager for help.
+Standard user account passwords must be rotated every 180 days.
+Privileged accounts must be rotated every 90 days. All remote access
+must go through the Tailscale Mesh VPN with MFA enabled.
+
+Source(s): it_security_policy.md — 2. Password and Authentication Requirements (effective 2024-01-15)
+           it_security_policy.md — 3. VPN and Remote Access (effective 2024-01-15)
 ```
 
-No source citations. No hallucinated answer.
+If the IT corpus hasn't been ingested yet, the IT agent will return a
+"No results found" refusal — ingest with `--corpus it` first.
 
 ### Test 3 — Cross-document question
 
@@ -547,47 +534,48 @@ content and skips any file that hasn't changed since the last run, so
 running it plainly after editing one document only re-chunks and
 re-embeds that document:
 ```bash
+# Re-ingest HR corpus (only changed files are processed)
 uv run python -m src.ask_buddy.ingest
+
+# Re-ingest IT corpus
+uv run python -m src.ask_buddy.ingest --corpus it
 ```
-Expected output for an unrelated unchanged file:
-```
-  pto_policy.md: unchanged, skipping
-  remote_work_policy.md: 8 sections, effective_date=2023-09-01
-...
-Done. 9 chunks stored across 1 file(s) (7 unchanged file(s) skipped).
-```
-Deleting a `.md` file from `data/hr_docs/synthetic/` and re-running also
-removes its chunks from `hr_chunks` automatically — no manual cleanup needed.
+Deleting a `.md` file from a corpus directory and re-running also removes
+its chunks automatically — no manual cleanup needed.
 
 Only pass `--clear` when you want to force a full rebuild (e.g. after
-changing the chunking logic itself) — it wipes `hr_chunks` and re-embeds
-every file regardless of whether it changed:
+changing the chunking logic itself) — it wipes chunks for that corpus only:
 ```bash
-uv run python -m src.ask_buddy.ingest --clear
-
-# Then remove IT security again (only needed after --clear)
-docker exec askbuddy_postgres psql -U askbuddy -d askbuddy \
-  -c "DELETE FROM hr_chunks WHERE source_filename = 'it_security_policy.md';"
+uv run python -m src.ask_buddy.ingest --clear            # HR only
+uv run python -m src.ask_buddy.ingest --corpus it --clear # IT only
 ```
 
 ---
 
-## 14. Adding Your Own HR Documents
+## 14. Adding Your Own Documents
 
+### HR documents
 1. Add your `.md` files to `data/hr_docs/synthetic/`
+2. Re-ingest: `uv run python -m src.ask_buddy.ingest`
 
-2. Each file should have a header like:
-   ```markdown
-   # Policy Title
-   **Effective Date:** YYYY-MM-DD
-   ```
+### IT documents
+1. Add your `.md` files to `data/it_docs/`
+2. Re-ingest: `uv run python -m src.ask_buddy.ingest --corpus it`
 
-3. Re-ingest — only new/changed files are processed, everything else is skipped:
-   ```bash
-   uv run python -m src.ask_buddy.ingest
-   ```
+### Adding a new domain
+1. Create a directory under `data/` (e.g. `data/finance_docs/`)
+2. Ingest with a custom corpus tag: `uv run python -m src.ask_buddy.ingest --corpus finance --docs-dir data/finance_docs`
+3. Add a matching retrieval tool in `retrieve.py` and sub-agent in `agent.py`
+4. Register the sub-agent with the supervisor in `build_supervisor()`
 
-4. The bot picks up the new content immediately — no restart needed.
+Each file should have a header like:
+```markdown
+# Policy Title
+**Effective Date:** YYYY-MM-DD
+```
+
+The bot picks up new content immediately — no restart needed. Only
+new/changed files are processed; unchanged files are skipped.
 
 For non-Markdown documents (PDF, DOCX), convert them to Markdown first
 or extend `ingest.py` to use a parser like `pypdf` or `python-docx`.
@@ -597,23 +585,25 @@ or extend `ingest.py` to use a parser like `pypdf` or `python-docx`.
 ## File Structure Reference
 
 ```
-meeting-scribe/
-├── data/hr_docs/synthetic/      8 HR policy markdown files
-│   ├── pto_policy.md            (two versions — tests date-specific queries)
-│   ├── parental_leave.md        (references benefits_enrollment.md)
-│   ├── benefits_enrollment.md
-│   ├── remote_work_policy.md
-│   ├── expense_reimbursement.md
-│   ├── performance_reviews.md
-│   ├── code_of_conduct.md
-│   └── it_security_policy.md    (out-of-scope doc — deleted from DB after ingest)
+AskBuddy/
+├── data/
+│   ├── hr_docs/synthetic/       7 HR policy markdown files
+│   │   ├── pto_policy.md        (two versions — tests date-specific queries)
+│   │   ├── parental_leave.md    (references benefits_enrollment.md)
+│   │   ├── benefits_enrollment.md
+│   │   ├── remote_work_policy.md
+│   │   ├── expense_reimbursement.md
+│   │   ├── performance_reviews.md
+│   │   └── code_of_conduct.md
+│   └── it_docs/                 IT security policy docs
+│       └── it_security_policy.md
 │
 ├── src/ask_buddy/
 │   ├── __init__.py
-│   ├── db.py                    Schema init, connection helper
-│   ├── ingest.py                Chunk → embed → store pipeline
-│   ├── retrieve.py              hybrid_retrieve tool (vector + FTS + RRF)
-│   ├── agent.py                 CugaAgent + system prompt
+│   ├── db.py                    Schema init, connection helper (corpus-aware)
+│   ├── ingest.py                Corpus-aware chunk → embed → store pipeline
+│   ├── retrieve.py              hr_retrieve, it_retrieve tools (vector + FTS + RRF)
+│   ├── agent.py                 CugaSupervisor + HR/IT sub-agents
 │   ├── feedback.py              Block Kit builder, 👎 modal, DB feedback helpers
 │   ├── feedback_report.py       Analytics CLI (refusals, reasons, clustering, evals)
 │   ├── feedback_digest.py       Weekly digest → Slack channel
@@ -621,10 +611,11 @@ meeting-scribe/
 │
 ├── tests/
 │   ├── conftest.py              Loads .env before test collection
-│   └── test_ask_buddy.py        17 tests (offline + integration)
+│   └── test_ask_buddy.py        Offline + integration tests
 │
 ├── docker-compose.askbuddy.yml  pgvector/pg16 container
 ├── .env.example                 Environment variable template
+├── SLACK_PERMISSIONS.md         Slack app setup reference
 ├── pyproject.toml               Python dependencies
 ├── README_ASKBUDDY.md           Architecture overview
 └── INSTALLATION.md              ← this file

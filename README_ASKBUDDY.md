@@ -1,23 +1,27 @@
-# Ask Buddy — Agentic HR RAG Bot for Slack
+# Ask Buddy — Multi-Domain Agentic RAG Bot for Slack
 
-Ask Buddy is a Slack bot that answers HR policy questions **exclusively** from
-your ingested HR document corpus using hybrid search (vector + keyword) and
-a CUGA agent that reasons over retrieved results before answering. It always
-cites the source document and section, and says *"No results found"* rather
-than hallucinating.
+Ask Buddy is a Slack bot that answers HR and IT policy questions from
+your ingested document corpora using hybrid search (vector + keyword) and
+a CugaSupervisor that routes queries to domain-specific sub-agents. It
+always cites the source document and section, and says *"No results
+found"* rather than hallucinating.
 
 ```
-Slack DM / @mention
+Slack DM / @mention / /askbuddy
       │
       ▼
 Slack Bolt (Socket Mode)
       │
       ▼
-CugaAgent  ──── hybrid_retrieve (pgvector cosine + Postgres FTS → RRF merge)
-      │                         │
-      │                  hr_chunks table
-      │                  (pgvector/pg16)
-      ▼
+CugaSupervisor ──── routes by topic
+      │
+      ├── hr_agent  ──── hr_retrieve  (corpus='hr')
+      │                       │
+      └── it_agent  ──── it_retrieve  (corpus='it')
+                              │
+                       hr_chunks table (pgvector/pg16)
+                       (corpus column scopes retrieval)
+                              │
 post_slack_message  ──▶  Slack
 ```
 
@@ -29,7 +33,7 @@ post_slack_message  ──▶  Slack
 |---|---|
 | Python 3.11+ | `uv` strongly recommended |
 | Docker | for the pgvector Postgres container |
-| OpenAI API key | embeddings + LLM reasoning |
+| Google API key | Gemini embeddings + LLM reasoning |
 | Slack workspace (admin) | to create the bot app |
 
 ---
@@ -90,39 +94,30 @@ ASK_BUDDY_DB_DSN=postgresql://askbuddy:askbuddy_secret@localhost:5432/askbuddy
 The `AGENT_SETTING_CONFIG` and `MODEL_NAME` values for the CUGA LLM are also
 read from `.env` (defaults to `openai` / `gpt-4o`).
 
-### Step 5 — Ingest the HR documents
+### Step 5 — Ingest the document corpora
+
+Ingest each corpus separately. The `--corpus` flag tags every chunk so
+retrieval stays scoped to the right domain.
 
 ```bash
+# HR documents (default)
 uv run python -m src.ask_buddy.ingest --clear
+
+# IT security documents
+uv run python -m src.ask_buddy.ingest --corpus it --clear
 ```
 
 This will:
 - Create the `hr_chunks` table and pgvector + GIN indexes (first run only).
-- Chunk all 8 markdown files under `data/hr_docs/synthetic/`.
-- Embed each chunk using `text-embedding-3-small`.
-- Store chunks + embeddings + full-text tsvector in Postgres.
+- Chunk all `*.md` files in the corpus directory.
+- Embed each chunk using `gemini-embedding-001`.
+- Store chunks + embeddings + full-text tsvector + corpus tag in Postgres.
 
-Expected output:
+Default directories: `data/hr_docs/synthetic/` for HR, `data/it_docs/` for IT.
+Override with `--docs-dir PATH`.
 
-```
-Schema initialised.
-hr_chunks table cleared.
-  benefits_enrollment.md: 7 sections, effective_date=2023-11-01
-  code_of_conduct.md: 7 sections, effective_date=2023-06-01
-  expense_reimbursement.md: 6 sections, effective_date=2023-04-01
-  it_security_policy.md: 7 sections, effective_date=2024-01-15
-  parental_leave.md: 7 sections, effective_date=2024-03-01
-  performance_reviews.md: 8 sections, effective_date=2023-01-01
-  pto_policy.md: 7 sections, effective_date=2024-01-01
-  remote_work_policy.md: 7 sections, effective_date=2023-09-01
-
-Embedding N chunks in batches of 32…
-  embedded 32/N
-  ...
-Done. N chunks stored.
-```
-
-To re-ingest after editing a document, pass `--clear` again to replace all chunks.
+To re-ingest after editing a document, pass `--clear` to replace all chunks
+for that corpus (other corpora are untouched).
 
 ### Step 6 — Start the bot
 
@@ -243,34 +238,51 @@ For at least TC-1 and TC-5:
 
 ## 4. Architecture Notes
 
+### CugaSupervisor Routing
+
+```
+user query
+     │
+CugaSupervisor ── "HR or IT?"
+     │
+     ├── hr_agent  → hr_retrieve (corpus='hr')
+     └── it_agent  → it_retrieve (corpus='it')
+```
+
+The supervisor inspects the query topic and delegates to the right sub-agent.
+Cross-domain questions are routed to both. Out-of-scope queries are refused
+directly by the supervisor without calling either agent.
+
 ### Hybrid Retrieval (RRF)
 
 ```
 query
-  ├─► text-embedding-3-small  ──► pgvector cosine search (top 20)  ──► list A
+  ├─► gemini-embedding-001     ──► pgvector cosine search (top 20)  ──► list A
   └─► plainto_tsquery          ──► GIN full-text search   (top 20)  ──► list B
                                                                           │
                               RRF merge: score = Σ 1/(60 + rank_i)  ◄────┘
                                                                           │
+                              corpus filter on hr_chunks.corpus      ◄────┘
+                                                                          │
                               Top-k chunks returned to agent         ◄────┘
 ```
 
-The RRF K=60 constant is a well-known default (Robertson et al.). Documents
-appearing in both lists receive a score boost naturally; no separate
-"late fusion" logic is needed.
+Each retrieval tool (`hr_retrieve`, `it_retrieve`) passes its corpus tag to
+`_vector_search` and `_keyword_search`, so results never leak across domains.
 
 ### Agent Guardrails
 
-- `enable_knowledge=False` — disables CUGA's built-in RAG so the agent cannot
-  answer from any source other than `hybrid_retrieve`.
-- The system prompt forbids general-knowledge answers, fabricated sources, and
-  blending partial guesses with the "No results found" message.
-- Tool list is strictly `[hybrid_retrieve, post_slack_message]` — no web search.
+- `enable_knowledge=False` — disables CUGA's built-in RAG so agents cannot
+  answer from any source other than their retrieval tool.
+- Each sub-agent's system prompt constrains it to its domain and forbids
+  general-knowledge answers, fabricated sources, and blending partial guesses
+  with the "No results found" message.
+- Tool lists are strictly `[<domain>_retrieve, post_slack_message]` — no web search.
 
 ### Effective Date Handling
 
 Each chunk is tagged with the `effective_date` parsed from the document header.
-Both PTO policy versions (2022-06-01 and 2024-01-01) are stored. The agent is
+Both PTO policy versions (2022-06-01 and 2024-01-01) are stored. Agents are
 instructed to prefer the latest effective_date unless the query explicitly asks
 about a past version.
 
@@ -280,17 +292,24 @@ about a past version.
 
 ```
 .
-├── data/hr_docs/synthetic/       8 HR policy markdown files
+├── data/
+│   ├── hr_docs/synthetic/        7 HR policy markdown files
+│   └── it_docs/                  IT security policy docs
 ├── docker-compose.askbuddy.yml   pgvector/pg16 container
 ├── src/ask_buddy/
 │   ├── __init__.py
 │   ├── db.py                     schema init, connection helper
-│   ├── ingest.py                 chunking + embedding + DB insert
-│   ├── retrieve.py               hybrid_retrieve @tool (vector+FTS+RRF)
-│   ├── agent.py                  CugaAgent builder with system prompt
+│   ├── ingest.py                 corpus-aware chunking + embedding
+│   ├── retrieve.py               hr_retrieve, it_retrieve @tools (vector+FTS+RRF)
+│   ├── agent.py                  CugaSupervisor + domain sub-agents
+│   ├── feedback.py               Block Kit feedback buttons + modals
+│   ├── feedback_report.py        analytics CLI (clustering, evals)
+│   ├── feedback_digest.py        weekly Slack digest
 │   └── slack_listener.py         Slack Bolt Socket Mode listener
 ├── tests/
 │   └── test_ask_buddy.py         offline + integration test cases
+├── SLACK_PERMISSIONS.md          Slack app setup reference
+├── INSTALLATION.md               detailed setup guide
 ├── .env.example                  environment variable template
 └── pyproject.toml                project dependencies
 ```

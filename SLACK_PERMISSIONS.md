@@ -27,12 +27,17 @@ no reply to DMs), check the matching section here first.
 | `im:write` | Start DM conversations |
 | `users:read` | Look up the Slack user who asked a question or clicked feedback |
 | `channels:history` | Read channel history so `@mention` events resolve correctly |
+| `channels:read` | Look up a public channel's ID from its name — needed so reminder commands like "remind #svl-interns-2026 to submit timecards" can resolve the channel to post to |
+| `groups:read` | Same lookup for private channels (skip if reminders will only ever target public channels) |
 | `app_mentions:read` | Receive `@Ask Buddy` mentions in channels |
 | `commands` | Register and receive the `/askbuddy` slash command |
 
 Missing `commands` is the most common cause of *"/askbuddy failed because
 the app did not respond"* — Slack rejects the command server-side before it
 ever reaches the bot if the scope isn't granted.
+
+Missing `channels:read` causes reminder creation to fail with "Could not
+find a Slack channel named '...'" even when the channel exists.
 
 After adding scopes: **Install to Workspace → Allow**, then copy the
 **Bot User OAuth Token** (starts with `xoxb-`).
