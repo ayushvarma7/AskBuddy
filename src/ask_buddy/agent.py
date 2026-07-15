@@ -1,11 +1,12 @@
 """
-Ask Buddy — CugaAgent setup.
+Ask Buddy — CugaSupervisor with domain-specific sub-agents.
 
-The agent is intentionally limited to exactly two tools:
-  1. hybrid_retrieve   — search the HR document corpus
-  2. post_slack_message — post the final answer back to Slack
+The supervisor routes each query to the right sub-agent:
+  - hr_agent   — answers HR policy questions (PTO, benefits, leave, …)
+  - it_agent   — answers IT security questions (passwords, VPN, MFA, …)
 
-No web search. No general-knowledge fallback.
+Each sub-agent has its own retrieval tool scoped to its corpus, plus a
+shared post_slack_message tool to deliver the final answer.
 """
 
 from __future__ import annotations
@@ -13,43 +14,22 @@ from __future__ import annotations
 import os
 from typing import Callable
 
-from cuga import CugaAgent
+from cuga import CugaAgent, CugaSupervisor
 from dotenv import load_dotenv
 
-from .retrieve import hybrid_retrieve
+from .retrieve import hr_retrieve, it_retrieve, hybrid_retrieve
 
 load_dotenv()
 
-SYSTEM_PROMPT = """You are Ask Buddy, an HR assistant for Acme Corp. \
-You may ONLY answer questions about HR topics: time off, leave, \
-benefits, expenses, performance reviews, remote work, and workplace \
-conduct. You have no other source of information — no general \
-knowledge, no internet access, no assumptions beyond what is \
-explicitly in the retrieved chunks.
+# ---------------------------------------------------------------------------
+# System prompts — one per domain agent
+# ---------------------------------------------------------------------------
 
-== SCOPE CHECK — do this FIRST before calling any tool ==
+_SHARED_RULES = """\
 
-Ask yourself: is this question about HR policy?
+== PROCESS ==
 
-HR topics (answer these): PTO, vacation, sick leave, parental leave, \
-benefits, health insurance, 401k, expense reimbursement, performance \
-reviews, remote work, code of conduct, workplace behaviour, \
-hiring, onboarding, offboarding, compensation policy.
-
-NOT HR topics (refuse immediately, do NOT call hybrid_retrieve): \
-IT security, passwords, VPN, firewalls, network access, software \
-licensing, device management, data classification, cybersecurity, \
-encryption, MFA setup, helpdesk tickets, engineering infrastructure.
-
-If the question is NOT an HR topic, respond IMMEDIATELY with EXACTLY \
-this sentence and nothing else — do not call any tool:
-
-   No results found in our HR documents for that question — please \
-reach out to HR or your manager for help.
-
-== PROCESS (for HR topics only) ==
-
-1. Call hybrid_retrieve with the user's question.
+1. Call your retrieval tool with the user's question.
 
 2. Read every returned chunk carefully. Ask yourself:
    - Does at least one chunk directly answer the question?
@@ -74,29 +54,127 @@ present in the retrieved chunk metadata.
 4. If nothing retrieved actually answers the question, respond with \
 EXACTLY this sentence and nothing else:
 
-   No results found in our HR documents for that question — please \
-reach out to HR or your manager for help.
+   No results found in our documents for that question — please \
+reach out to the appropriate team for help.
 
 == HARD RULES ==
 - Never answer from general knowledge.
 - Never blend a partial guess with the "No results found" message.
 - Never print internal reasoning, tool call details, or raw JSON \
 in the final Slack message.
-- When multiple document versions exist (e.g. old vs. new PTO policy), \
-default to the version with the LATEST effective_date unless the user \
-explicitly asks about a past version.
+- When multiple document versions exist, default to the version with the \
+LATEST effective_date unless the user explicitly asks about a past version.
+"""
+
+HR_SYSTEM_PROMPT = """\
+You are the HR Agent within Ask Buddy. You answer questions about \
+HR topics ONLY: time off, leave, benefits, expenses, performance \
+reviews, remote work, and workplace conduct. You have no other source \
+of information — no general knowledge, no internet access, no \
+assumptions beyond what is explicitly in the retrieved chunks.
+
+Use hr_retrieve to search the HR document corpus.
+""" + _SHARED_RULES
+
+IT_SYSTEM_PROMPT = """\
+You are the IT Security Agent within Ask Buddy. You answer questions \
+about IT and information security topics ONLY: passwords, \
+authentication, MFA, VPN, remote access, device management, endpoint \
+security, data classification, data handling, and acceptable use of \
+company IT resources. You have no other source of information.
+
+Use it_retrieve to search the IT security document corpus.
+""" + _SHARED_RULES
+
+SCHEDULER_SYSTEM_PROMPT = """\
+You are the Scheduler Agent within Ask Buddy. You manage recurring \
+broadcast reminders posted to Slack channels — e.g. "remind \
+#svl-interns-2026 to submit timecards every day at 9am PST".
+
+You have three tools: create_reminder, list_reminders, cancel_reminder.
+
+== CREATING A REMINDER ==
+
+Extract from the user's request:
+  - channel: the Slack channel name (strip any leading '#')
+  - message: the exact text to broadcast
+  - cron_expression: standard 5-field cron syntax (minute hour day month \
+day-of-week), translated from the user's natural-language schedule
+  - timezone: an IANA timezone name
+
+Cron translation examples:
+  "every day at 9:00 AM"        -> "0 9 * * *"
+  "every Friday at 9:00 AM"     -> "0 9 * * 5"
+  "every weekday at 2:30 PM"    -> "30 14 * * 1-5"
+  "every Monday and Wednesday at 8 AM" -> "0 8 * * 1,3"
+
+Timezone translation:
+  "PST"/"PT"/"Pacific"  -> "America/Los_Angeles"
+  "EST"/"ET"/"Eastern"  -> "America/New_York"
+  "CST"/"CT"/"Central"  -> "America/Chicago"
+  If no timezone is mentioned, default to "America/Los_Angeles".
+
+If the user does not specify a day (e.g. just "at 9am"), default to \
+every day ("* " in the day-of-week field) — but ALWAYS state your \
+interpreted schedule back to the user in plain English in your reply \
+(e.g. "I've scheduled this to repeat every day at 9:00 AM Pacific") so \
+they can correct it if that's wrong.
+
+Call create_reminder with the extracted channel, message, cron_expression, \
+and timezone. Report the confirmation (including the reminder id) back \
+to the user via post_slack_message.
+
+== LISTING / CANCELLING ==
+
+Use list_reminders to show active reminders (optionally filtered by \
+channel). Use cancel_reminder with the reminder id to cancel one. \
+Always confirm the result via post_slack_message.
+
+== HARD RULES ==
+- Never fabricate a channel, cron expression, or reminder id.
+- If the schedule or channel is genuinely ambiguous and cannot be \
+reasonably inferred, ask the user to clarify via post_slack_message \
+instead of guessing.
+"""
+
+SUPERVISOR_PROMPT = """\
+You are Ask Buddy, a workplace assistant for Acme Corp. You supervise \
+specialist agents:
+
+  • hr_agent — handles HR policy questions (PTO, vacation, sick leave, \
+parental leave, benefits, health insurance, 401k, expense \
+reimbursement, performance reviews, remote work, code of conduct, \
+workplace behaviour, hiring, onboarding, offboarding, compensation).
+
+  • it_agent — handles IT and security questions (passwords, MFA, VPN, \
+firewalls, network access, device management, endpoint security, data \
+classification, data handling, acceptable use, software licensing, \
+encryption, helpdesk).
+
+  • scheduler_agent — creates, lists, and cancels recurring broadcast \
+reminders posted to Slack channels (e.g. "remind #channel to do X every \
+day at 9am").
+
+When a user asks a question or gives a command:
+1. Determine which agent it belongs to and delegate to it.
+2. If a question spans both hr_agent and it_agent, delegate to each and \
+combine their answers.
+3. Requests to create/list/cancel a reminder always go to scheduler_agent, \
+never to hr_agent or it_agent.
+4. If the request is clearly outside all three domains (e.g. personal \
+advice, general trivia), respond directly with:
+   No results found in our documents for that question — please \
+reach out to the appropriate team for help.
+
+Always deliver the final answer via post_slack_message.
 """
 
 
-def _fewshot_block() -> str:
-    """
-    Optional few-shot examples appended to the system prompt, curated from
-    the highest-rated past answers. Off by default; enable by setting
-    ASK_BUDDY_FEWSHOT to the number of examples to include (e.g. 3).
+# ---------------------------------------------------------------------------
+# Few-shot injection (shared, opt-in)
+# ---------------------------------------------------------------------------
 
-    This is a manual "prompt tuning from feedback" loop — good answers the
-    users liked become exemplars that reinforce the desired format.
-    """
+def _fewshot_block() -> str:
     try:
         n = int(os.environ.get("ASK_BUDDY_FEWSHOT", "0") or "0")
     except ValueError:
@@ -108,7 +186,6 @@ def _fewshot_block() -> str:
         from .db import get_positive_examples
         examples = get_positive_examples(limit=n)
     except Exception:
-        # Never let feedback lookup break agent construction.
         return ""
 
     if not examples:
@@ -126,25 +203,22 @@ def _fewshot_block() -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Agent config tracking (for A/B feedback comparison)
+# ---------------------------------------------------------------------------
+
 def current_agent_config() -> str:
-    """
-    A short identifier for the LLM/agent config that produced an answer,
-    e.g. 'settings.google.toml:gemini-2.5-flash'. Stored on each feedback
-    row so answer quality can be compared across configs (A/B) later.
-    """
     setting = os.environ.get("AGENT_SETTING_CONFIG", "default")
     model = os.environ.get("MODEL_NAME", "default")
     return f"{setting}:{model}"
 
 
-def build_agent(slack_post_fn: Callable[[str, str], None]) -> CugaAgent:
-    """
-    Build and return a CugaAgent configured as Ask Buddy.
+# ---------------------------------------------------------------------------
+# Agent builders
+# ---------------------------------------------------------------------------
 
-    Args:
-        slack_post_fn: a callable(channel, text) that posts a message
-                       to Slack. Wrapped into the post_slack_message tool.
-    """
+def _build_post_tool(slack_post_fn: Callable[[str, str], None]):
+    """Create the post_slack_message @tool closure."""
     from langchain_core.tools import tool
 
     @tool
@@ -152,15 +226,173 @@ def build_agent(slack_post_fn: Callable[[str, str], None]) -> CugaAgent:
         """
         Post `text` to the specified Slack `channel` or DM thread.
         Always call this as the final step to deliver your answer to the user.
-        `channel` should be the channel_id or DM conversation id provided
-        in the context.
         """
         slack_post_fn(channel, text)
         return "Message posted."
 
+    return post_slack_message
+
+
+def build_hr_agent(slack_post_fn: Callable[[str, str], None]) -> CugaAgent:
+    """Build the HR-domain sub-agent."""
+    post_tool = _build_post_tool(slack_post_fn)
+    return CugaAgent(
+        tools=[hr_retrieve, post_tool],
+        enable_knowledge=False,
+        special_instructions=HR_SYSTEM_PROMPT + _fewshot_block(),
+    )
+
+
+def build_it_agent(slack_post_fn: Callable[[str, str], None]) -> CugaAgent:
+    """Build the IT-security-domain sub-agent."""
+    post_tool = _build_post_tool(slack_post_fn)
+    return CugaAgent(
+        tools=[it_retrieve, post_tool],
+        enable_knowledge=False,
+        special_instructions=IT_SYSTEM_PROMPT,
+    )
+
+
+def _default_resolve_channel(channel: str) -> tuple[str, str]:
+    """Fallback channel resolver: treats the given string as already an ID."""
+    name = channel.lstrip("#")
+    return channel, name
+
+
+def _build_reminder_tools(
+    resolve_channel_fn: Callable[[str], tuple[str, str]],
+    created_by: str | None,
+):
+    """
+    Build the create_reminder / list_reminders / cancel_reminder @tools.
+
+    resolve_channel_fn(channel_str) -> (channel_id, channel_name), used to
+    turn a bare channel name from the user's message into the Slack channel
+    ID the Web API needs to post there.
+    """
+    from langchain_core.tools import tool
+
+    @tool
+    def create_reminder(channel: str, message: str, cron_expression: str,
+                        timezone: str = "America/Los_Angeles") -> dict:
+        """
+        Schedule a recurring reminder message to be posted in a Slack channel.
+
+        channel: Slack channel name (e.g. 'svl-interns-2026') or ID.
+        message: the exact text to broadcast each time the reminder fires.
+        cron_expression: standard 5-field cron syntax, e.g. '0 9 * * *' for
+            every day at 9:00 AM, or '0 9 * * 5' for every Friday at 9:00 AM.
+        timezone: IANA timezone name, e.g. 'America/Los_Angeles' for PT.
+
+        Returns a dict: {id, channel_name, message, cron_expression, timezone}.
+        """
+        from .db import insert_reminder
+        from .scheduler import schedule_new_reminder
+
+        channel_id, channel_name = resolve_channel_fn(channel)
+        reminder_id = insert_reminder(
+            channel_id=channel_id, channel_name=channel_name, message=message,
+            cron_expression=cron_expression, timezone=timezone,
+            created_by=created_by,
+        )
+        schedule_new_reminder(reminder_id, channel_id, message, cron_expression, timezone)
+        return {
+            "id": reminder_id,
+            "channel_name": channel_name,
+            "message": message,
+            "cron_expression": cron_expression,
+            "timezone": timezone,
+        }
+
+    @tool
+    def list_reminders(channel: str = "") -> list[dict]:
+        """
+        List active reminders, optionally filtered to one Slack channel
+        (name or ID). Returns each reminder's id, channel_name, message,
+        cron_expression, and timezone.
+        """
+        from .db import list_reminders_for_channel
+
+        channel_id = None
+        if channel:
+            channel_id, _ = resolve_channel_fn(channel)
+        rows = list_reminders_for_channel(channel_id)
+        return [
+            {
+                "id": r["id"],
+                "channel_name": r["channel_name"],
+                "message": r["message"],
+                "cron_expression": r["cron_expression"],
+                "timezone": r["timezone"],
+            }
+            for r in rows
+        ]
+
+    @tool
+    def cancel_reminder(reminder_id: int) -> str:
+        """Cancel an active reminder by its id (from create_reminder or list_reminders)."""
+        from .db import deactivate_reminder
+        from .scheduler import unschedule_reminder
+
+        found = deactivate_reminder(reminder_id)
+        if not found:
+            return f"No active reminder with id {reminder_id} found."
+        unschedule_reminder(reminder_id)
+        return f"Reminder #{reminder_id} cancelled."
+
+    return create_reminder, list_reminders, cancel_reminder
+
+
+def build_scheduler_agent(
+    slack_post_fn: Callable[[str, str], None],
+    resolve_channel_fn: Callable[[str], tuple[str, str]] | None = None,
+    created_by: str | None = None,
+) -> CugaAgent:
+    """Build the reminder-scheduling sub-agent."""
+    post_tool = _build_post_tool(slack_post_fn)
+    create_reminder, list_reminders, cancel_reminder = _build_reminder_tools(
+        resolve_channel_fn or _default_resolve_channel, created_by,
+    )
+    return CugaAgent(
+        tools=[create_reminder, list_reminders, cancel_reminder, post_tool],
+        enable_knowledge=False,
+        special_instructions=SCHEDULER_SYSTEM_PROMPT,
+    )
+
+
+def build_supervisor(
+    slack_post_fn: Callable[[str, str], None],
+    resolve_channel_fn: Callable[[str], tuple[str, str]] | None = None,
+    created_by: str | None = None,
+) -> CugaSupervisor:
+    """
+    Build the CugaSupervisor that routes queries to domain sub-agents.
+
+    The supervisor itself also has post_slack_message so it can deliver
+    out-of-scope refusals or combined answers directly.
+    """
+    hr = build_hr_agent(slack_post_fn)
+    it = build_it_agent(slack_post_fn)
+    scheduler = build_scheduler_agent(slack_post_fn, resolve_channel_fn, created_by)
+
+    supervisor = CugaSupervisor(
+        agents={"hr_agent": hr, "it_agent": it, "scheduler_agent": scheduler},
+        special_instructions=SUPERVISOR_PROMPT,
+    )
+    return supervisor
+
+
+def build_agent(slack_post_fn: Callable[[str, str], None]) -> CugaAgent:
+    """
+    Backward-compatible single-agent builder.
+
+    Kept for tests and simple deployments that don't need multi-domain
+    routing. Uses the original HR-scoped hybrid_retrieve.
+    """
+    post_tool = _build_post_tool(slack_post_fn)
     agent = CugaAgent(
-        tools=[hybrid_retrieve, post_slack_message],
-        enable_knowledge=False,   # we manage our own retrieval
-        special_instructions=SYSTEM_PROMPT + _fewshot_block(),
+        tools=[hybrid_retrieve, post_tool],
+        enable_knowledge=False,
+        special_instructions=HR_SYSTEM_PROMPT + _fewshot_block(),
     )
     return agent
