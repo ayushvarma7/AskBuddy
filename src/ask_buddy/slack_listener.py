@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sys
 import threading
 import traceback
@@ -68,6 +69,74 @@ try:
     log.info("ask_buddy_feedback table ready.")
 except Exception as _e:
     log.warning("Could not initialise feedback schema: %s", _e)
+
+# Ensure the reminders table exists at startup (idempotent)
+try:
+    from .db import init_reminders_schema
+    init_reminders_schema()
+    log.info("ask_buddy_reminders table ready.")
+except Exception as _e:
+    log.warning("Could not initialise reminders schema: %s", _e)
+
+
+# ---------------------------------------------------------------------------
+# Channel name -> ID resolution (needed by the scheduler_agent's reminder
+# tools, since users name a channel like 'svl-interns-2026', not its ID)
+# ---------------------------------------------------------------------------
+
+_CHANNEL_ID_RE = re.compile(r"^[CGD][A-Z0-9]{8,}$")
+_channel_name_to_id: dict[str, str] = {}
+
+
+def _refresh_channel_cache() -> None:
+    global _channel_name_to_id
+    cache: dict[str, str] = {}
+    cursor = None
+    while True:
+        resp = app.client.conversations_list(
+            types="public_channel,private_channel", limit=200, cursor=cursor
+        )
+        for ch in resp.get("channels", []):
+            cache[ch["name"]] = ch["id"]
+        cursor = (resp.get("response_metadata") or {}).get("next_cursor")
+        if not cursor:
+            break
+    _channel_name_to_id = cache
+
+
+def resolve_channel(channel: str) -> tuple[str, str]:
+    """
+    Resolve a Slack channel name (with or without '#') or ID to
+    (channel_id, channel_name). Requires the channels:read (and, for
+    private channels, groups:read) Bot Token Scope.
+    """
+    raw = channel.strip()
+    name = raw.lstrip("#")
+    if _CHANNEL_ID_RE.match(name):
+        return name, name
+    if name not in _channel_name_to_id:
+        _refresh_channel_cache()
+    channel_id = _channel_name_to_id.get(name)
+    if channel_id is None:
+        raise ValueError(f"Could not find a Slack channel named '{name}'.")
+    return channel_id, name
+
+
+# ---------------------------------------------------------------------------
+# Reminder scheduler startup — recurring broadcast reminders
+# ---------------------------------------------------------------------------
+
+def _plain_post(channel: str, text: str) -> None:
+    """Post without feedback buttons — used for reminder broadcasts."""
+    app.client.chat_postMessage(channel=channel, text=text)
+
+
+try:
+    from .scheduler import start_scheduler
+    start_scheduler(_plain_post)
+    log.info("Reminder scheduler started.")
+except Exception as _e:
+    log.warning("Could not start reminder scheduler: %s", _e)
 
 
 # ---------------------------------------------------------------------------
@@ -131,14 +200,13 @@ def _post_answer_with_feedback(
 def _run_agent_for_message(user_text: str, channel: str, user: str,
                             thread_ts: str | None = None) -> None:
     """
-    Run the CUGA agent in a plain thread.
+    Run the CugaSupervisor in a plain thread.
 
-    Bolt's Socket Mode dispatcher is synchronous; calling asyncio.run()
-    inside it deadlocks when an existing event loop is already running.
-    Running in a thread gives us a clean loop via asyncio.run().
+    The supervisor decides whether the query is HR, IT, or cross-domain,
+    then delegates to the appropriate sub-agent(s).
     """
-    posted_answers: list[str] = []   # track what the agent posted via the tool
-    retrieved_chunk_ids: list[int] = []   # filled from the pre-retrieval below
+    posted_answers: list[str] = []
+    retrieved_chunk_ids: list[int] = []
 
     from src.ask_buddy.agent import current_agent_config
     agent_config = current_agent_config()
@@ -154,43 +222,40 @@ def _run_agent_for_message(user_text: str, channel: str, user: str,
     prompt = (
         f"A Slack user (id: {user}) in channel {channel} asks:\n\n"
         f"{user_text}\n\n"
-        f"Use hybrid_retrieve to find the answer, then call "
+        f"Route this to the right agent, then call "
         f"post_slack_message with channel='{channel}' to deliver your response."
     )
 
-    log.info("[agent] starting | user=%s channel=%s query=%r",
+    log.info("[supervisor] starting | user=%s channel=%s query=%r",
              user, channel, user_text[:120])
 
     try:
-        # Retrieve first so we can log and catch retrieval errors separately
-        from src.ask_buddy.retrieve import hybrid_retrieve
-        chunks = hybrid_retrieve.invoke({"query": user_text, "top_k": 5})
+        from src.ask_buddy.retrieve import _hybrid_retrieve_core
+        chunks = _hybrid_retrieve_core(user_text, top_k=5)
         if chunks and "error" in chunks[0]:
-            raise RuntimeError(f"hybrid_retrieve error: {chunks[0]['error']}")
-        # Record the chunk IDs surfaced for this question so feedback can be
-        # attributed back to specific source chunks. This is the pre-retrieval
-        # set; the agent may reformulate internally, but this is a faithful
-        # proxy for which chunks the answer is grounded in.
+            raise RuntimeError(f"retrieve error: {chunks[0]['error']}")
         retrieved_chunk_ids[:] = [c["id"] for c in chunks if "id" in c]
-        log.info("[agent] retrieved %d chunks: %s",
+        log.info("[supervisor] pre-retrieved %d chunks: %s",
                  len(chunks), [c.get("source_filename") for c in chunks])
 
-        # Build agent and invoke — runs a fresh event loop in this thread
-        from src.ask_buddy.agent import build_agent
-        agent = build_agent(slack_post_fn=_post)
-        result = asyncio.run(
-            agent.invoke(prompt, thread_id=f"slack-{channel}-{user}")
+        from src.ask_buddy.agent import build_supervisor
+        supervisor = build_supervisor(
+            slack_post_fn=_post,
+            resolve_channel_fn=resolve_channel,
+            created_by=user,
         )
-        log.info("[agent] invoke complete | answer[:120]=%r",
+        result = asyncio.run(
+            supervisor.invoke(prompt, thread_id=f"slack-{channel}-{user}")
+        )
+        log.info("[supervisor] invoke complete | answer[:120]=%r",
                  (getattr(result, "answer", None) or "")[:120])
 
-        # Safety net: agent returned answer but never called post_slack_message
         answer = getattr(result, "answer", None)
         if answer and not posted_answers:
             _post(channel, answer)
 
     except Exception:
-        log.error("[agent] UNHANDLED EXCEPTION:\n%s", traceback.format_exc())
+        log.error("[supervisor] UNHANDLED EXCEPTION:\n%s", traceback.format_exc())
         app.client.chat_postMessage(
             channel=channel,
             text=(
@@ -217,7 +282,7 @@ def handle_dm_message(event, say, logger):
     if not user_text:
         return
 
-    say(text="⏳ Looking that up in our HR docs…", channel=channel)
+    say(text="⏳ Looking that up…", channel=channel)
 
     t = threading.Thread(
         target=_run_agent_for_message,
@@ -244,7 +309,7 @@ def handle_slash_command(ack, command, respond):
         respond("Ask me something, e.g. `/askbuddy how many PTO days do I get?`")
         return
 
-    respond("⏳ Looking that up in our HR docs…")
+    respond("⏳ Looking that up…")
 
     t = threading.Thread(
         target=_run_agent_for_message,
@@ -400,11 +465,11 @@ def handle_app_mention(event, say, logger):
     thread_ts: str | None = event.get("thread_ts") or event.get("ts")
 
     if not user_text:
-        say(text="Hi! Ask me anything about Acme Corp HR policies.",
+        say(text="Hi! Ask me anything about Acme Corp HR or IT policies.",
             channel=channel, thread_ts=thread_ts)
         return
 
-    say(text="⏳ Looking that up in our HR docs…", channel=channel,
+    say(text="⏳ Looking that up…", channel=channel,
         thread_ts=thread_ts)
 
     t = threading.Thread(
