@@ -2712,6 +2712,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "apscheduler" },
     { name = "cuga" },
+    { name = "httpx" },
     { name = "langchain-google-genai" },
     { name = "pgvector" },
     { name = "psycopg2-binary" },
@@ -2725,6 +2726,7 @@ dependencies = [
 requires-dist = [
     { name = "apscheduler", specifier = ">=3.10.4" },
     { name = "cuga", specifier = ">=0.3.0" },
+    { name = "httpx", specifier = ">=0.27.0" },
     { name = "langchain-google-genai", specifier = ">=2.0.0" },
     { name = "pgvector", specifier = ">=0.3.2" },
     { name = "psycopg2-binary", specifier = ">=2.9.9" },

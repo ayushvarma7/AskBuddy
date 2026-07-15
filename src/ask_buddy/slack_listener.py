@@ -78,6 +78,14 @@ try:
 except Exception as _e:
     log.warning("Could not initialise reminders schema: %s", _e)
 
+# Ensure the git-watch table exists at startup (idempotent)
+try:
+    from .db import init_git_watch_schema
+    init_git_watch_schema()
+    log.info("ask_buddy_git_watch table ready.")
+except Exception as _e:
+    log.warning("Could not initialise git-watch schema: %s", _e)
+
 
 # ---------------------------------------------------------------------------
 # Channel name -> ID resolution (needed by the scheduler_agent's reminder
@@ -137,6 +145,13 @@ try:
     log.info("Reminder scheduler started.")
 except Exception as _e:
     log.warning("Could not start reminder scheduler: %s", _e)
+
+# Proactive GitHub triage watcher (polls GitHub, posts to GIT_WATCH_CHANNEL)
+try:
+    from .git_watch import start_git_watch
+    start_git_watch(_plain_post)   # reuse the no-feedback-buttons poster
+except Exception as _e:
+    log.warning("Could not start git watch: %s", _e)
 
 
 # ---------------------------------------------------------------------------

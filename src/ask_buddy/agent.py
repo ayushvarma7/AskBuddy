@@ -137,6 +137,57 @@ reasonably inferred, ask the user to clarify via post_slack_message \
 instead of guessing.
 """
 
+GIT_ISSUE_SYSTEM_PROMPT = """\
+You are the Git Issue Agent within Ask Buddy. You answer READ-ONLY questions \
+about GitHub issues: listing open/closed issues, summarizing a specific issue, \
+who is assigned, what labels it has, and searching issues.
+
+You have these tools: list_issues, get_issue, search_issues. You CANNOT create, \
+edit, comment on, or close issues — you are read-only. If a user asks you to \
+change anything, tell them plainly that Ask Buddy's git access is read-only.
+
+== PROCESS ==
+1. Identify the repository as 'owner/name'. If the user did not give a repo and \
+one cannot be inferred, ask them which repo (via post_slack_message).
+2. Call the right tool. Read the result.
+3. Reply in plain English. For lists, show issue number, title, and state, one \
+per line, most recent first. For a single issue, summarize title, state, author, \
+labels, assignees, and a 1-2 sentence gist of the body. Always include the \
+issue URL(s).
+
+== HARD RULES ==
+- Read-only. Never claim to have changed anything.
+- Never fabricate issue numbers, titles, authors, or URLs — only report what the \
+tool returned.
+- If a tool returns an error (e.g. GitHub not configured, repo not found), relay \
+a short, clear message; do not guess.
+- Deliver the final answer via post_slack_message.
+"""
+
+GIT_PR_SYSTEM_PROMPT = """\
+You are the Git PR Agent within Ask Buddy. You answer READ-ONLY questions about \
+GitHub pull requests: listing open/closed PRs, summarizing a specific PR, its \
+review status, requested reviewers, and CI check results.
+
+You have these tools: list_pull_requests, get_pull_request, get_pr_reviews, \
+get_pr_checks. You CANNOT open, approve, comment on, or merge PRs — read-only.
+
+== PROCESS ==
+1. Identify the repository as 'owner/name'; ask if missing.
+2. Call the right tool(s). To answer "is PR #N ready to merge?" combine \
+get_pull_request (draft/mergeable_state), get_pr_reviews (approvals), and \
+get_pr_checks (CI pass/fail).
+3. Reply in plain English. For lists: PR number, title, author, draft flag. For \
+a single PR: title, author, base<-head, reviewers + their verdicts, CI summary \
+(X passed / Y failed / Z pending), and the PR URL.
+
+== HARD RULES ==
+- Read-only. Never claim to have merged/approved/commented.
+- Never fabricate PR numbers, reviewers, verdicts, or check results.
+- On tool error, relay a short clear message; do not guess.
+- Deliver the final answer via post_slack_message.
+"""
+
 SUPERVISOR_PROMPT = """\
 You are Ask Buddy, a workplace assistant for Acme Corp. You supervise \
 specialist agents:
@@ -155,6 +206,12 @@ encryption, helpdesk).
 reminders posted to Slack channels (e.g. "remind #channel to do X every \
 day at 9am").
 
+  • git_issue_agent — READ-ONLY questions about GitHub issues (list/summarize \
+issues, labels, assignees, search issues) for a given 'owner/repo'.
+
+  • git_pr_agent — READ-ONLY questions about GitHub pull requests (list/summarize \
+PRs, review status, requested reviewers, CI check results) for a given 'owner/repo'.
+
 When a user asks a question or gives a command:
 1. Determine which agent it belongs to and delegate to it.
 2. If a question spans both hr_agent and it_agent, delegate to each and \
@@ -165,6 +222,11 @@ never to hr_agent or it_agent.
 advice, general trivia), respond directly with:
    No results found in our documents for that question — please \
 reach out to the appropriate team for help.
+5. GitHub *issue* questions go to git_issue_agent; GitHub *pull request* / PR / \
+review / CI-check questions go to git_pr_agent. If a git question needs both \
+(e.g. "summarize all activity on repo X"), delegate to both and combine. \
+Ask Buddy's git access is READ-ONLY — if a user asks to create/close/merge \
+anything, explain that plainly instead of delegating.
 
 Always deliver the final answer via post_slack_message.
 """
@@ -343,6 +405,99 @@ def _build_reminder_tools(
     return create_reminder, list_reminders, cancel_reminder
 
 
+def _build_git_issue_tools():
+    from langchain_core.tools import tool
+    from . import github_client as gh
+
+    @tool
+    def list_issues(repo: str, state: str = "open") -> list[dict]:
+        """List GitHub issues for 'owner/repo'. state: 'open'|'closed'|'all'.
+        Returns number, title, state, author, labels, assignees, url. Read-only."""
+        try:
+            return gh.list_issues(repo, state=state)
+        except gh.GitHubError as e:
+            return [{"error": str(e)}]
+
+    @tool
+    def get_issue(repo: str, number: int) -> dict:
+        """Get one GitHub issue by number from 'owner/repo', including a truncated
+        body. Read-only."""
+        try:
+            return gh.get_issue(repo, number)
+        except gh.GitHubError as e:
+            return {"error": str(e)}
+
+    @tool
+    def search_issues(query: str) -> list[dict]:
+        """Search issues/PRs with GitHub search syntax, e.g.
+        'repo:acme/backend is:open label:bug'. Read-only."""
+        try:
+            return gh.search_issues(query)
+        except gh.GitHubError as e:
+            return [{"error": str(e)}]
+
+    return list_issues, get_issue, search_issues
+
+
+def _build_git_pr_tools():
+    from langchain_core.tools import tool
+    from . import github_client as gh
+
+    @tool
+    def list_pull_requests(repo: str, state: str = "open") -> list[dict]:
+        """List GitHub pull requests for 'owner/repo'. Read-only."""
+        try:
+            return gh.list_pull_requests(repo, state=state)
+        except gh.GitHubError as e:
+            return [{"error": str(e)}]
+
+    @tool
+    def get_pull_request(repo: str, number: int) -> dict:
+        """Get one PR by number from 'owner/repo'. Read-only."""
+        try:
+            return gh.get_pull_request(repo, number)
+        except gh.GitHubError as e:
+            return {"error": str(e)}
+
+    @tool
+    def get_pr_reviews(repo: str, number: int) -> list[dict]:
+        """List reviews (reviewer + APPROVED/CHANGES_REQUESTED/COMMENTED) for a PR."""
+        try:
+            return gh.get_pr_reviews(repo, number)
+        except gh.GitHubError as e:
+            return [{"error": str(e)}]
+
+    @tool
+    def get_pr_checks(repo: str, number: int) -> dict:
+        """Summarize CI check-runs (passed/failed/pending) for a PR's head commit."""
+        try:
+            return gh.get_pr_checks(repo, number)
+        except gh.GitHubError as e:
+            return {"error": str(e)}
+
+    return list_pull_requests, get_pull_request, get_pr_reviews, get_pr_checks
+
+
+def build_git_issue_agent(slack_post_fn: Callable[[str, str], None]) -> CugaAgent:
+    post_tool = _build_post_tool(slack_post_fn)
+    list_issues, get_issue, search_issues = _build_git_issue_tools()
+    return CugaAgent(
+        tools=[list_issues, get_issue, search_issues, post_tool],
+        enable_knowledge=False,
+        special_instructions=GIT_ISSUE_SYSTEM_PROMPT,
+    )
+
+
+def build_git_pr_agent(slack_post_fn: Callable[[str, str], None]) -> CugaAgent:
+    post_tool = _build_post_tool(slack_post_fn)
+    list_prs, get_pr, get_reviews, get_checks = _build_git_pr_tools()
+    return CugaAgent(
+        tools=[list_prs, get_pr, get_reviews, get_checks, post_tool],
+        enable_knowledge=False,
+        special_instructions=GIT_PR_SYSTEM_PROMPT,
+    )
+
+
 def build_scheduler_agent(
     slack_post_fn: Callable[[str, str], None],
     resolve_channel_fn: Callable[[str], tuple[str, str]] | None = None,
@@ -374,9 +529,17 @@ def build_supervisor(
     hr = build_hr_agent(slack_post_fn)
     it = build_it_agent(slack_post_fn)
     scheduler = build_scheduler_agent(slack_post_fn, resolve_channel_fn, created_by)
+    git_issue = build_git_issue_agent(slack_post_fn)
+    git_pr = build_git_pr_agent(slack_post_fn)
 
     supervisor = CugaSupervisor(
-        agents={"hr_agent": hr, "it_agent": it, "scheduler_agent": scheduler},
+        agents={
+            "hr_agent": hr,
+            "it_agent": it,
+            "scheduler_agent": scheduler,
+            "git_issue_agent": git_issue,
+            "git_pr_agent": git_pr,
+        },
         special_instructions=SUPERVISOR_PROMPT,
     )
     return supervisor

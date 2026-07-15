@@ -7,6 +7,7 @@ dependencies = [
     "cuga>=0.3.0",
     "tavily-python>=0.7.26",
     # Ask Buddy — agentic HR RAG bot for Slack
+    "httpx>=0.27.0",
     "langchain-google-genai>=2.0.0",
     "psycopg2-binary>=2.9.9",
     "pgvector>=0.3.2",

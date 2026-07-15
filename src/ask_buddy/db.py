@@ -75,6 +75,21 @@ _REMINDERS_TABLE_DDL = """
 """
 
 
+# ---------------------------------------------------------------------------
+# Git watch state (proactive triage dedup — one row per watched repo)
+# ---------------------------------------------------------------------------
+# last_issue_number / last_pr_number : highest number already reported to Slack.
+#   On each poll we only report items with number > the stored high-water mark.
+_GIT_WATCH_TABLE_DDL = """
+    CREATE TABLE IF NOT EXISTS ask_buddy_git_watch (
+        repo               TEXT        PRIMARY KEY,   -- 'owner/name'
+        last_issue_number  INTEGER     NOT NULL DEFAULT 0,
+        last_pr_number     INTEGER     NOT NULL DEFAULT 0,
+        last_polled_at     TIMESTAMPTZ
+    );
+"""
+
+
 def _dsn() -> str:
     dsn = os.environ.get("ASK_BUDDY_DB_DSN")
     if not dsn:
@@ -160,6 +175,8 @@ def init_schema() -> None:
 
     -- Broadcast reminders scheduled via the in-process scheduler
     """ + _REMINDERS_TABLE_DDL + """
+    -- Git watch state for proactive triage dedup
+    """ + _GIT_WATCH_TABLE_DDL + """
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -172,6 +189,43 @@ def init_reminders_schema() -> None:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(_REMINDERS_TABLE_DDL)
+
+
+def init_git_watch_schema() -> None:
+    """Idempotent: create just the git-watch table. Safe to call at bot startup."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(_GIT_WATCH_TABLE_DDL)
+
+
+def get_git_watermark(repo: str) -> dict:
+    """Return {'last_issue_number', 'last_pr_number'} for a repo (0/0 if new)."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT last_issue_number, last_pr_number "
+                "FROM ask_buddy_git_watch WHERE repo = %s;", (repo,))
+            row = cur.fetchone()
+            if row is None:
+                return {"last_issue_number": 0, "last_pr_number": 0}
+            return {"last_issue_number": row["last_issue_number"],
+                    "last_pr_number": row["last_pr_number"]}
+
+
+def set_git_watermark(repo: str, last_issue_number: int, last_pr_number: int) -> None:
+    """Upsert the high-water marks + last_polled_at=now() for a repo."""
+    sql = """
+        INSERT INTO ask_buddy_git_watch
+            (repo, last_issue_number, last_pr_number, last_polled_at)
+        VALUES (%(repo)s, %(iss)s, %(pr)s, now())
+        ON CONFLICT (repo) DO UPDATE
+            SET last_issue_number = EXCLUDED.last_issue_number,
+                last_pr_number    = EXCLUDED.last_pr_number,
+                last_polled_at    = now();
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, {"repo": repo, "iss": last_issue_number, "pr": last_pr_number})
 
 
 def get_ingested_hashes(corpus: str = "hr") -> dict[str, str]:
