@@ -92,6 +92,19 @@ _GIT_WATCH_TABLE_DDL = """
 """
 
 
+# ---------------------------------------------------------------------------
+# Git identity table DDL (Slack user -> GitHub login mapping)
+# ---------------------------------------------------------------------------
+
+_GIT_IDENTITIES_TABLE_DDL = """
+    CREATE TABLE IF NOT EXISTS ask_buddy_git_identities (
+        slack_user_id  TEXT PRIMARY KEY,
+        github_login   TEXT NOT NULL,
+        linked_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+"""
+
+
 def _dsn() -> str:
     dsn = os.environ.get("ASK_BUDDY_DB_DSN")
     if not dsn:
@@ -184,6 +197,38 @@ def init_schema() -> None:
         with conn.cursor() as cur:
             cur.execute(ddl)
     print("Schema initialised.")
+
+
+def init_git_identities_schema() -> None:
+    """Idempotent: create just the git-identities table. Safe at bot startup."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(_GIT_IDENTITIES_TABLE_DDL)
+
+
+def link_github_identity(slack_user_id: str, github_login: str) -> None:
+    """Upsert the Slack user -> GitHub login mapping."""
+    sql = """
+        INSERT INTO ask_buddy_git_identities (slack_user_id, github_login, linked_at)
+        VALUES (%(slack_user_id)s, %(github_login)s, now())
+        ON CONFLICT (slack_user_id) DO UPDATE
+            SET github_login = EXCLUDED.github_login, linked_at = now();
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, {"slack_user_id": slack_user_id, "github_login": github_login})
+
+
+def get_github_login(slack_user_id: str) -> str | None:
+    """Return the linked GitHub login for a Slack user, or None if unlinked."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT github_login FROM ask_buddy_git_identities WHERE slack_user_id = %s;",
+                (slack_user_id,),
+            )
+            row = cur.fetchone()
+            return row["github_login"] if row else None
 
 
 def init_reminders_schema() -> None:
