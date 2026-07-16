@@ -991,3 +991,197 @@ class TestGitIdentityDB:
         # Re-link should upsert, not duplicate.
         link_github_identity("U_TEST_IDENTITY", "octocat2")
         assert get_github_login("U_TEST_IDENTITY") == "octocat2"
+
+
+# ---------------------------------------------------------------------------
+# Reliability & Correctness fixes — new tests
+# ---------------------------------------------------------------------------
+
+class TestSupervisorCache:
+    def test_same_thread_id_returns_same_object(self):
+        import src.ask_buddy.slack_listener as sl
+        dummy_post = lambda ch, txt: None
+        dummy_resolve = lambda ch: (ch, ch)
+        sup1 = sl._get_or_build_supervisor(
+            "test-thread-cache", dummy_post, dummy_resolve, "U1")
+        sup2 = sl._get_or_build_supervisor(
+            "test-thread-cache", dummy_post, dummy_resolve, "U1")
+        assert sup1 is sup2, "Should return the cached supervisor"
+
+    def test_different_thread_ids_build_separate_supervisors(self):
+        import src.ask_buddy.slack_listener as sl
+        dummy_post = lambda ch, txt: None
+        dummy_resolve = lambda ch: (ch, ch)
+        sup_a = sl._get_or_build_supervisor(
+            "cache-thread-A", dummy_post, dummy_resolve, "U1")
+        sup_b = sl._get_or_build_supervisor(
+            "cache-thread-B", dummy_post, dummy_resolve, "U2")
+        assert sup_a is not sup_b
+
+    def test_evict_removes_only_stale_entries(self):
+        import src.ask_buddy.slack_listener as sl
+        import time
+        with sl._supervisor_cache_lock:
+            sl._supervisor_cache["stale-sup"] = {"supervisor": "S", "last_used": time.time() - 7200}
+            sl._supervisor_cache["fresh-sup"] = {"supervisor": "F", "last_used": time.time()}
+        sl._evict_idle_supervisors()
+        with sl._supervisor_cache_lock:
+            assert "stale-sup" not in sl._supervisor_cache
+            assert "fresh-sup" in sl._supervisor_cache
+            # cleanup
+            sl._supervisor_cache.pop("fresh-sup", None)
+
+
+class TestApprovalBlocksWithSummary:
+    def test_action_summary_appears_in_footer(self):
+        import src.ask_buddy.slack_listener as sl
+        blocks = sl._build_approval_blocks("tid", "confirm?", action_summary="merge PR #5")
+        text_parts = [
+            el.get("text", "")
+            for b in blocks
+            for el in (b.get("elements") or [{"text": b.get("text", {}).get("text", "")}])
+        ]
+        combined = " ".join(str(p) for p in text_parts)
+        assert "merge PR #5" in combined
+
+    def test_expiry_time_appears_in_footer(self):
+        import src.ask_buddy.slack_listener as sl
+        blocks = sl._build_approval_blocks("tid2", "confirm?")
+        context_blocks = [b for b in blocks if b["type"] == "context"]
+        assert context_blocks, "Expected a context block with expiry"
+        footer_text = context_blocks[0]["elements"][0]["text"]
+        assert "Expires" in footer_text
+
+
+class TestGitHubClientRetry:
+    def test_retries_on_500_then_succeeds(self, monkeypatch):
+        import src.ask_buddy.github_client as gh
+        import httpx
+        call_count = [0]
+
+        class FakeResp:
+            def __init__(self, status, body=""):
+                self.status_code = status
+                self.text = body
+                self.headers = {}
+            def json(self):
+                return {"items": []}
+
+        def fake_get(*a, **kw):
+            call_count[0] += 1
+            if call_count[0] < 3:
+                return FakeResp(500, "oops")
+            return FakeResp(200)
+
+        monkeypatch.setattr(gh, "_RETRY_BASE_SLEEP", 0)   # no real sleep in tests
+        monkeypatch.setattr(httpx, "get", fake_get)
+        result = gh._request("/search/issues", {"q": "test"})
+        assert call_count[0] == 3
+        assert result == {"items": []}
+
+    def test_rate_limit_window_blocks_subsequent_calls(self, monkeypatch):
+        import src.ask_buddy.github_client as gh
+        import time
+        monkeypatch.setattr(gh, "_rate_limit_reset_epoch", time.time() + 3600)
+        with pytest.raises(gh.GitHubError, match="rate limit"):
+            gh._check_rate_limit_window()
+        # cleanup so other tests aren't affected
+        monkeypatch.setattr(gh, "_rate_limit_reset_epoch", 0.0)
+
+
+class TestEmbedderSingleton:
+    def test_embedder_is_reused_across_calls(self, monkeypatch):
+        import src.ask_buddy.retrieve as ret
+        # Reset module-level singleton so this test is self-contained
+        monkeypatch.setattr(ret, "_embedder", None)
+        monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+
+        creation_count = [0]
+        original_cls = __import__(
+            "langchain_google_genai", fromlist=["GoogleGenerativeAIEmbeddings"]
+        ).GoogleGenerativeAIEmbeddings
+
+        class CountingEmbedder(original_cls):
+            def __init__(self, *a, **kw):
+                creation_count[0] += 1
+                # Don't call super().__init__ to avoid real network calls
+        import langchain_google_genai as lggai
+        monkeypatch.setattr(lggai, "GoogleGenerativeAIEmbeddings", CountingEmbedder)
+        monkeypatch.setattr(ret, "GoogleGenerativeAIEmbeddings", CountingEmbedder)
+
+        ret._get_embedder()
+        ret._get_embedder()
+        assert creation_count[0] == 1, "Embedder should be constructed only once"
+        monkeypatch.setattr(ret, "_embedder", None)  # cleanup
+
+
+class TestNewGitHubClientFunctions:
+    def test_remove_label_calls_delete(self, monkeypatch):
+        import src.ask_buddy.github_client as gh
+        calls = []
+        monkeypatch.setattr(
+            gh, "_request_write",
+            lambda method, path, json_body=None: calls.append((method, path)) or [{"name": "other"}]
+        )
+        result = gh.remove_label("a/b", 1, "bug")
+        assert calls[0][0] == "DELETE"
+        assert "labels/bug" in calls[0][1]
+        assert result["labels_remaining"] == ["other"]
+
+    def test_unassign_users_calls_delete(self, monkeypatch):
+        import src.ask_buddy.github_client as gh
+        calls = []
+        monkeypatch.setattr(
+            gh, "_request_write",
+            lambda method, path, json_body=None: calls.append((method, path)) or {"assignees": []}
+        )
+        gh.unassign_users("a/b", 1, ["alice"])
+        assert calls[0][0] == "DELETE"
+        assert "assignees" in calls[0][1]
+
+    def test_create_issue_returns_number_and_url(self, monkeypatch):
+        import src.ask_buddy.github_client as gh
+        monkeypatch.setattr(
+            gh, "_request_write",
+            lambda method, path, json_body=None: {
+                "number": 99, "html_url": "http://x/99", "state": "open"
+            }
+        )
+        result = gh.create_issue("a/b", "New bug", body="details")
+        assert result["number"] == 99
+        assert result["url"] == "http://x/99"
+
+    def test_create_pull_request_returns_pr_dict(self, monkeypatch):
+        import src.ask_buddy.github_client as gh
+        monkeypatch.setattr(
+            gh, "_request_write",
+            lambda method, path, json_body=None: {
+                "number": 42, "title": "My PR", "state": "open",
+                "draft": False, "user": {"login": "alice"}, "labels": [],
+                "requested_reviewers": [], "base": {"ref": "main"},
+                "head": {"ref": "feat", "sha": "abc"},
+                "mergeable_state": None, "created_at": None,
+                "updated_at": None, "html_url": "http://x/42", "body": "",
+            }
+        )
+        result = gh.create_pull_request("a/b", "My PR", "feat", "main")
+        assert result["number"] == 42
+        assert result["url"] == "http://x/42"
+
+
+class TestGitWatchRateLimitSkip:
+    def test_rate_limit_error_logs_warning_not_generic(self, monkeypatch, caplog):
+        import logging
+        import src.ask_buddy.git_watch as gw
+        import src.ask_buddy.github_client as gh
+
+        monkeypatch.setenv("GIT_WATCH_CHANNEL", "eng")
+
+        def _raise_rate_limit(*a, **kw):
+            raise gh.GitHubError("GitHub rate limit active — resets in ~120s.")
+
+        monkeypatch.setattr(gh, "list_issues", _raise_rate_limit)
+        with caplog.at_level(logging.WARNING, logger="ask_buddy.git_watch"):
+            gw.poll_once("a/b", lambda ch, txt: None)
+
+        assert any("rate limited" in r.message for r in caplog.records)
