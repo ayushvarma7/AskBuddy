@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>AskBuddy — System Architecture</title>
+<style>
+  body {
+    font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+    background: #ffffff;
+    margin: 0;
+    padding: 24px 16px 48px;
+    color: #1f2328;
+  }
+  .page { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+  p.sub { font-size: 13px; color: #57606a; margin: 0 0 24px; }
+  svg { display: block; width: 100%; height: auto; }
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 20px; font-size: 12px; color: #57606a; }
+  .legend-item { display: flex; align-items: center; gap: 6px; }
+  .swatch { width: 14px; height: 14px; border-radius: 3px; flex-shrink: 0; }
+  footer {
+    margin-top: 40px;
+    padding-top: 12px;
+    border-top: 1px solid #e5e7eb;
+    text-align: center;
+    font-size: 12px;
+    color: #57606a;
+  }
+</style>
+</head>
+<body>
+<div class="page">
+  <h1>AskBuddy — System Architecture</h1>
+  <p class="sub">Request flow (blue), write-action approval loop (amber), background polling (green), data stores (purple)</p>
+
+  <svg viewBox="0 0 720 620" xmlns="http://www.w3.org/2000/svg" aria-label="AskBuddy architecture diagram">
+    <defs>
+      <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L0,6 L8,3 z" fill="#3b82d4"/>
+      </marker>
+      <marker id="arr-amber" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L0,6 L8,3 z" fill="#d97706"/>
+      </marker>
+      <marker id="arr-green" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L0,6 L8,3 z" fill="#16a34a"/>
+      </marker>
+      <marker id="arr-purple" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L0,6 L8,3 z" fill="#7c5cd8"/>
+      </marker>
+      <marker id="arr-gray" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L0,6 L8,3 z" fill="#57606a"/>
+      </marker>
+    </defs>
+
+    <!-- Slack -->
+    <rect x="240" y="10" width="240" height="44" rx="6" fill="#e0f0ff" stroke="#3b82d4" stroke-width="1.5"/>
+    <text x="360" y="28" text-anchor="middle" font-size="12" font-weight="600" fill="#1f2328">Slack Workspace</text>
+    <text x="360" y="44" text-anchor="middle" font-size="11" fill="#57606a">DM · @mention · /askbuddy</text>
+
+    <line x1="360" y1="54" x2="360" y2="84" stroke="#3b82d4" stroke-width="1.5" marker-end="url(#arr)"/>
+
+    <!-- Bolt -->
+    <rect x="240" y="85" width="240" height="40" rx="6" fill="#f7f8fa" stroke="#e5e7eb" stroke-width="1.5"/>
+    <text x="360" y="101" text-anchor="middle" font-size="12" font-weight="600" fill="#1f2328">Slack Bolt</text>
+    <text x="360" y="116" text-anchor="middle" font-size="11" fill="#57606a">Socket Mode listener</text>
+
+    <line x1="360" y1="125" x2="360" y2="157" stroke="#3b82d4" stroke-width="1.5" marker-end="url(#arr)"/>
+
+    <!-- Supervisor -->
+    <rect x="200" y="158" width="320" height="44" rx="6" fill="#dbeafe" stroke="#3b82d4" stroke-width="2"/>
+    <text x="360" y="176" text-anchor="middle" font-size="13" font-weight="700" fill="#1e3a8a">CugaSupervisor</text>
+    <text x="360" y="192" text-anchor="middle" font-size="11" fill="#3b82d4">routes by intent · manages approval loop</text>
+
+    <!-- fan to sub-agents -->
+    <line x1="360" y1="202" x2="360" y2="225" stroke="#3b82d4" stroke-width="1.5"/>
+    <line x1="65"  y1="225" x2="655" y2="225" stroke="#3b82d4" stroke-width="1.5"/>
+    <line x1="65"  y1="225" x2="65"  y2="248" stroke="#3b82d4" stroke-width="1.5" marker-end="url(#arr)"/>
+    <line x1="195" y1="225" x2="195" y2="248" stroke="#3b82d4" stroke-width="1.5" marker-end="url(#arr)"/>
+    <line x1="360" y1="225" x2="360" y2="248" stroke="#3b82d4" stroke-width="1.5" marker-end="url(#arr)"/>
+    <line x1="510" y1="225" x2="510" y2="248" stroke="#3b82d4" stroke-width="1.5" marker-end="url(#arr)"/>
+    <line x1="655" y1="225" x2="655" y2="248" stroke="#3b82d4" stroke-width="1.5" marker-end="url(#arr)"/>
+
+    <!-- hr_agent -->
+    <rect x="10" y="249" width="110" height="36" rx="5" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+    <text x="65" y="263" text-anchor="middle" font-size="11" font-weight="600" fill="#15803d">hr_agent</text>
+    <text x="65" y="277" text-anchor="middle" font-size="10" fill="#57606a">HR policies</text>
+
+    <!-- it_agent -->
+    <rect x="140" y="249" width="110" height="36" rx="5" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+    <text x="195" y="263" text-anchor="middle" font-size="11" font-weight="600" fill="#15803d">it_agent</text>
+    <text x="195" y="277" text-anchor="middle" font-size="10" fill="#57606a">IT security</text>
+
+    <!-- scheduler_agent -->
+    <rect x="305" y="249" width="110" height="36" rx="5" fill="#fefce8" stroke="#ca8a04" stroke-width="1.5"/>
+    <text x="360" y="263" text-anchor="middle" font-size="11" font-weight="600" fill="#92400e">scheduler_agent</text>
+    <text x="360" y="277" text-anchor="middle" font-size="10" fill="#57606a">reminders</text>
+
+    <!-- git_issue_agent -->
+    <rect x="450" y="249" width="120" height="36" rx="5" fill="#fdf4ff" stroke="#7c5cd8" stroke-width="1.5"/>
+    <text x="510" y="263" text-anchor="middle" font-size="11" font-weight="600" fill="#5b21b6">git_issue_agent</text>
+    <text x="510" y="277" text-anchor="middle" font-size="10" fill="#57606a">Issues R/W</text>
+
+    <!-- git_pr_agent -->
+    <rect x="590" y="249" width="120" height="36" rx="5" fill="#fdf4ff" stroke="#7c5cd8" stroke-width="1.5"/>
+    <text x="655" y="263" text-anchor="middle" font-size="11" font-weight="600" fill="#5b21b6">git_pr_agent</text>
+    <text x="655" y="277" text-anchor="middle" font-size="10" fill="#57606a">PRs + CI R/W</text>
+
+    <!-- hr_retrieve -->
+    <line x1="65" y1="285" x2="65" y2="314" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arr-green)"/>
+    <rect x="10" y="315" width="110" height="34" rx="5" fill="#f7f8fa" stroke="#e5e7eb" stroke-width="1.5"/>
+    <text x="65" y="329" text-anchor="middle" font-size="10" font-weight="600" fill="#1f2328">hr_retrieve</text>
+    <text x="65" y="342" text-anchor="middle" font-size="9.5" fill="#57606a">corpus='hr' · RRF</text>
+
+    <!-- it_retrieve -->
+    <line x1="195" y1="285" x2="195" y2="314" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arr-green)"/>
+    <rect x="140" y="315" width="110" height="34" rx="5" fill="#f7f8fa" stroke="#e5e7eb" stroke-width="1.5"/>
+    <text x="195" y="329" text-anchor="middle" font-size="10" font-weight="600" fill="#1f2328">it_retrieve</text>
+    <text x="195" y="342" text-anchor="middle" font-size="9.5" fill="#57606a">corpus='it' · RRF</text>
+
+    <!-- set_reminder -->
+    <line x1="360" y1="285" x2="360" y2="314" stroke="#ca8a04" stroke-width="1.5" marker-end="url(#arr-amber)"/>
+    <rect x="305" y="315" width="110" height="34" rx="5" fill="#f7f8fa" stroke="#e5e7eb" stroke-width="1.5"/>
+    <text x="360" y="329" text-anchor="middle" font-size="10" font-weight="600" fill="#1f2328">set_reminder</text>
+    <text x="360" y="342" text-anchor="middle" font-size="9.5" fill="#57606a">list / cancel</text>
+
+    <!-- issue tools -->
+    <line x1="510" y1="285" x2="510" y2="314" stroke="#7c5cd8" stroke-width="1.5" marker-end="url(#arr-purple)"/>
+    <rect x="447" y="315" width="126" height="34" rx="5" fill="#f7f8fa" stroke="#e5e7eb" stroke-width="1.5"/>
+    <text x="510" y="329" text-anchor="middle" font-size="10" font-weight="600" fill="#1f2328">issue tools (8)</text>
+    <text x="510" y="342" text-anchor="middle" font-size="9.5" fill="#57606a">list · get · comment · label…</text>
+
+    <!-- pr tools -->
+    <line x1="655" y1="285" x2="655" y2="314" stroke="#7c5cd8" stroke-width="1.5" marker-end="url(#arr-purple)"/>
+    <rect x="590" y="315" width="126" height="34" rx="5" fill="#f7f8fa" stroke="#e5e7eb" stroke-width="1.5"/>
+    <text x="655" y="329" text-anchor="middle" font-size="10" font-weight="600" fill="#1f2328">PR tools (8)</text>
+    <text x="655" y="342" text-anchor="middle" font-size="9.5" fill="#57606a">list · get · merge · review…</text>
+
+    <!-- pgvector DB -->
+    <line x1="65"  y1="349" x2="65"  y2="384" stroke="#57606a" stroke-width="1.5" marker-end="url(#arr-gray)"/>
+    <line x1="195" y1="349" x2="195" y2="384" stroke="#57606a" stroke-width="1.5" marker-end="url(#arr-gray)"/>
+    <line x1="65" y1="384" x2="195" y2="384" stroke="#57606a" stroke-width="1.5"/>
+    <line x1="130" y1="384" x2="130" y2="395" stroke="#57606a" stroke-width="1.5" marker-end="url(#arr-gray)"/>
+    <rect x="50" y="396" width="160" height="44" rx="5" fill="#f5f0ff" stroke="#7c5cd8" stroke-width="1.5"/>
+    <text x="130" y="413" text-anchor="middle" font-size="11" font-weight="600" fill="#5b21b6">Postgres + pgvector</text>
+    <text x="130" y="428" text-anchor="middle" font-size="10" fill="#57606a">hr_chunks · it_chunks · reminders</text>
+
+    <!-- scheduler → postgres -->
+    <line x1="360" y1="349" x2="360" y2="380" stroke="#57606a" stroke-width="1"/>
+    <line x1="360" y1="380" x2="210" y2="380" stroke="#57606a" stroke-width="1"/>
+    <line x1="210" y1="380" x2="210" y2="396" stroke="#57606a" stroke-width="1" marker-end="url(#arr-gray)"/>
+
+    <!-- git tools → github api -->
+    <line x1="510" y1="349" x2="510" y2="390" stroke="#7c5cd8" stroke-width="1.5"/>
+    <line x1="655" y1="349" x2="655" y2="390" stroke="#7c5cd8" stroke-width="1.5"/>
+    <line x1="510" y1="390" x2="655" y2="390" stroke="#7c5cd8" stroke-width="1.5"/>
+    <line x1="582" y1="390" x2="582" y2="401" stroke="#7c5cd8" stroke-width="1.5" marker-end="url(#arr-purple)"/>
+    <rect x="510" y="402" width="144" height="44" rx="5" fill="#fdf4ff" stroke="#7c5cd8" stroke-width="1.5"/>
+    <text x="582" y="419" text-anchor="middle" font-size="11" font-weight="600" fill="#5b21b6">GitHub REST API</text>
+    <text x="582" y="434" text-anchor="middle" font-size="10" fill="#57606a">Fine-grained PAT (R/W)</text>
+
+    <!-- approval loop -->
+    <path d="M582,402 C582,370 440,370 440,202" stroke="#d97706" stroke-width="1.5" fill="none" stroke-dasharray="5,3" marker-end="url(#arr-amber)"/>
+    <rect x="430" y="360" width="134" height="28" rx="4" fill="#fffbeb" stroke="#d97706" stroke-width="1"/>
+    <text x="497" y="373" text-anchor="middle" font-size="10" fill="#92400e">high-risk: pause graph</text>
+    <text x="497" y="384" text-anchor="middle" font-size="10" fill="#92400e">Confirm / Cancel in Slack</text>
+
+    <!-- Bolt → Slack response -->
+    <path d="M240,105 C180,105 150,54 240,38" stroke="#3b82d4" stroke-width="1.5" fill="none" stroke-dasharray="4,3" marker-end="url(#arr)"/>
+    <text x="168" y="78" text-anchor="middle" font-size="10" fill="#3b82d4">response</text>
+
+    <!-- git_watch -->
+    <rect x="10" y="480" width="200" height="54" rx="5" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+    <text x="110" y="498" text-anchor="middle" font-size="11" font-weight="600" fill="#15803d">git_watch (APScheduler)</text>
+    <text x="110" y="512" text-anchor="middle" font-size="10" fill="#57606a">poll every N min</text>
+    <text x="110" y="525" text-anchor="middle" font-size="10" fill="#57606a">watermarks in DB</text>
+
+    <line x1="210" y1="507" x2="510" y2="450" stroke="#16a34a" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arr-green)"/>
+    <line x1="110" y1="480" x2="290" y2="54" stroke="#16a34a" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arr-green)"/>
+    <rect x="110" y="400" width="126" height="22" rx="3" fill="#f0fdf4" stroke="#16a34a" stroke-width="1"/>
+    <text x="173" y="415" text-anchor="middle" font-size="10" fill="#15803d">triage channel posts</text>
+
+    <!-- git_digest -->
+    <rect x="230" y="480" width="200" height="54" rx="5" fill="#fefce8" stroke="#ca8a04" stroke-width="1.5"/>
+    <text x="330" y="498" text-anchor="middle" font-size="11" font-weight="600" fill="#92400e">git_digest (APScheduler)</text>
+    <text x="330" y="512" text-anchor="middle" font-size="10" fill="#57606a">daily cron (configurable)</text>
+    <text x="330" y="525" text-anchor="middle" font-size="10" fill="#57606a">full repo state summary</text>
+
+    <line x1="430" y1="507" x2="520" y2="450" stroke="#ca8a04" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arr-amber)"/>
+    <line x1="330" y1="480" x2="348" y2="54" stroke="#ca8a04" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arr-amber)"/>
+
+    <!-- Feedback -->
+    <rect x="450" y="480" width="160" height="54" rx="5" fill="#f7f8fa" stroke="#e5e7eb" stroke-width="1.5"/>
+    <text x="530" y="498" text-anchor="middle" font-size="11" font-weight="600" fill="#1f2328">Feedback (Block Kit)</text>
+    <text x="530" y="512" text-anchor="middle" font-size="10" fill="#57606a">thumbs up/down modal</text>
+    <text x="530" y="525" text-anchor="middle" font-size="10" fill="#57606a">stored in DB</text>
+
+    <line x1="530" y1="480" x2="420" y2="54" stroke="#57606a" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#arr-gray)"/>
+
+    <!-- identity table -->
+    <rect x="50" y="455" width="160" height="22" rx="3" fill="#f5f0ff" stroke="#7c5cd8" stroke-width="1"/>
+    <text x="130" y="470" text-anchor="middle" font-size="10" fill="#5b21b6">+ ask_buddy_git_identities</text>
+  </svg>
+
+  <div class="legend">
+    <div class="legend-item"><div class="swatch" style="background:#3b82d4;"></div> Request / response flow</div>
+    <div class="legend-item"><div class="swatch" style="background:#16a34a;"></div> Background polling / retrieval</div>
+    <div class="legend-item"><div class="swatch" style="background:#d97706;"></div> Write-action approval loop</div>
+    <div class="legend-item"><div class="swatch" style="background:#7c5cd8;"></div> GitHub API / git agent tools</div>
+    <div class="legend-item"><div class="swatch" style="background:#ca8a04;"></div> Scheduler / digest</div>
+    <div class="legend-item"><div class="swatch" style="background:#57606a;"></div> Feedback / misc</div>
+  </div>
+
+  <footer>Made with IBM Bob</footer>
+</div>
+</body>
+</html>

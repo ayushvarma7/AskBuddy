@@ -243,16 +243,39 @@ For at least TC-1 and TC-5:
 
 ## 4. Architecture Notes
 
-### CugaSupervisor Routing
+> A full interactive diagram is in [`docs/architecture.html`](docs/architecture.html)
+> (open in a browser). The key flows are summarised below.
+
+### Component Overview
 
 ```
-user query
-     │
-CugaSupervisor ── "HR or IT?"
-     │
-     ├── hr_agent  → hr_retrieve (corpus='hr')
-     └── it_agent  → it_retrieve (corpus='it')
+Slack DM / @mention / /askbuddy
+      │
+Slack Bolt (Socket Mode)
+      │
+CugaSupervisor ─────────────────────── routes by intent
+      │
+      ├── hr_agent        → hr_retrieve  (corpus='hr', pgvector+FTS RRF)
+      ├── it_agent        → it_retrieve  (corpus='it', pgvector+FTS RRF)
+      ├── scheduler_agent → set/list/cancel reminders (APScheduler + DB)
+      ├── git_issue_agent → 8 issue tools (read + write, PAT required)
+      └── git_pr_agent    → 8 PR/CI tools (read + write, PAT required)
+                                 │
+                          GitHub REST API
+                          Fine-grained PAT (R/W on Issues + PRs)
+
+Background (APScheduler):
+  git_watch   ──every N min──▶ poll new issues/PRs ──▶ Slack triage channel
+  git_digest  ──daily cron──▶  full repo state ──▶ Slack digest channel
+
+Write-action approval loop:
+  high-risk tool call ──▶ CugaSupervisor pauses graph
+                      ──▶ Bolt posts ✅ Confirm / ❌ Cancel to Slack
+                      ──▶ user clicks ──▶ graph resumes or discards
+                      (unconfirmed requests expire after 30 min)
 ```
+
+### CugaSupervisor Routing
 
 The supervisor inspects the query topic and delegates to the right sub-agent.
 Cross-domain questions are routed to both. Out-of-scope queries are refused
