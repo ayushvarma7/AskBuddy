@@ -890,3 +890,104 @@ class TestGitAgentWriteTools:
         assert "get_pr_merge_status" in pr_tools
         assert "merge_pull_request" in dangerous_tools
         assert "set_issue_state" in dangerous_tools
+
+
+# ---------------------------------------------------------------------------
+# Phase B tests — pending-approval registry and sweep
+# ---------------------------------------------------------------------------
+
+class TestPendingApprovalRegistry:
+    def test_stash_and_pop_roundtrip(self):
+        import src.ask_buddy.slack_listener as sl
+        sl._stash_pending_approval("t1", supervisor="FAKE", channel="C1",
+                                   user_text="merge PR #1", agent_config="cfg",
+                                   retrieved_chunk_ids=[1, 2])
+        popped = sl._pop_pending_approval("t1")
+        assert popped["supervisor"] == "FAKE"
+        assert popped["channel"] == "C1"
+        assert popped["retrieved_chunk_ids"] == [1, 2]
+        # Popped once — a second pop must return None (already consumed).
+        assert sl._pop_pending_approval("t1") is None
+
+    def test_pop_missing_thread_returns_none(self):
+        import src.ask_buddy.slack_listener as sl
+        assert sl._pop_pending_approval("does-not-exist") is None
+
+    def test_sweep_evicts_only_expired(self):
+        import src.ask_buddy.slack_listener as sl
+        import time
+        sl._stash_pending_approval("fresh", supervisor="F", channel="C",
+                                   user_text="x", agent_config="cfg",
+                                   retrieved_chunk_ids=[])
+        sl._stash_pending_approval("stale", supervisor="S", channel="C",
+                                   user_text="x", agent_config="cfg",
+                                   retrieved_chunk_ids=[])
+        # Force the "stale" entry's created_at into the past.
+        with sl._pending_approvals_lock:
+            sl._pending_approvals["stale"]["created_at"] = time.time() - 3600
+        sl._sweep_expired_approvals()
+        assert sl._pop_pending_approval("fresh") is not None
+        assert sl._pop_pending_approval("stale") is None
+
+    def test_build_approval_blocks_carries_thread_id(self):
+        import json
+        import src.ask_buddy.slack_listener as sl
+        blocks = sl._build_approval_blocks("thread-xyz", "confirm?")
+        actions_block = next(b for b in blocks if b["type"] == "actions")
+        for el in actions_block["elements"]:
+            assert json.loads(el["value"])["thread_id"] == "thread-xyz"
+
+
+# ---------------------------------------------------------------------------
+# Phase D tests — GITHUB_DEFAULT_REPO prompt block
+# ---------------------------------------------------------------------------
+
+class TestDefaultRepoBlock:
+    def test_empty_when_unset(self, monkeypatch):
+        from src.ask_buddy.agent import _default_repo_block
+        monkeypatch.delenv("GITHUB_DEFAULT_REPO", raising=False)
+        assert _default_repo_block() == ""
+
+    def test_includes_repo_when_set(self, monkeypatch):
+        from src.ask_buddy.agent import _default_repo_block
+        monkeypatch.setenv("GITHUB_DEFAULT_REPO", "acme/widgets")
+        block = _default_repo_block()
+        assert "acme/widgets" in block
+
+
+# ---------------------------------------------------------------------------
+# Phase E tests — GitHub identity linking and resolution
+# ---------------------------------------------------------------------------
+
+class TestGitIdentityLinking:
+    def test_resolve_my_github_login_no_user_context(self):
+        from src.ask_buddy.agent import _build_git_identity_tools
+        (resolve,) = _build_git_identity_tools(None)
+        assert "error" in resolve.invoke({})
+
+    def test_resolve_my_github_login_unlinked(self, monkeypatch):
+        import src.ask_buddy.agent as agent_mod
+        monkeypatch.setattr(agent_mod, "get_github_login", lambda uid: None)
+        (resolve,) = agent_mod._build_git_identity_tools("U123")
+        result = resolve.invoke({})
+        assert "hasn't linked" in result
+
+    def test_resolve_my_github_login_linked(self, monkeypatch):
+        import src.ask_buddy.agent as agent_mod
+        monkeypatch.setattr(agent_mod, "get_github_login", lambda uid: "octocat")
+        (resolve,) = agent_mod._build_git_identity_tools("U123")
+        assert resolve.invoke({}) == "octocat"
+
+
+class TestGitIdentityDB:
+    @integration
+    def test_link_and_get_roundtrip(self):
+        from src.ask_buddy.db import (
+            init_git_identities_schema, link_github_identity, get_github_login,
+        )
+        init_git_identities_schema()
+        link_github_identity("U_TEST_IDENTITY", "octocat")
+        assert get_github_login("U_TEST_IDENTITY") == "octocat"
+        # Re-link should upsert, not duplicate.
+        link_github_identity("U_TEST_IDENTITY", "octocat2")
+        assert get_github_login("U_TEST_IDENTITY") == "octocat2"
