@@ -60,7 +60,10 @@ def _format_summary(repo: str, new_issues: list[dict], new_prs: list[dict]) -> s
 
 def poll_once(repo: str, post_fn: Callable[[str, str], None]) -> None:
     """Poll one repo, post a summary of items newer than the watermark, then
-    advance the watermark. First sight of a repo seeds silently (no post)."""
+    advance the watermark. First sight of a repo seeds silently (no post).
+
+    If github_client reports a rate-limit window is still active, the poll
+    is skipped gracefully rather than hammering the API and logging errors."""
     channel = _channel()
     if not channel:
         return
@@ -68,7 +71,11 @@ def poll_once(repo: str, post_fn: Callable[[str, str], None]) -> None:
         issues = gh.list_issues(repo, state="open")
         prs = gh.list_pull_requests(repo, state="open")
     except gh.GitHubError as e:
-        log.warning("[git_watch] poll failed for %s: %s", repo, e)
+        if "rate limit" in str(e).lower():
+            log.warning("[git_watch] rate limited — skipping poll for %s (will retry next interval): %s",
+                        repo, e)
+        else:
+            log.warning("[git_watch] poll failed for %s: %s", repo, e)
         return
 
     max_issue = max([i["number"] for i in issues], default=0)
