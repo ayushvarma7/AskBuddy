@@ -11,6 +11,7 @@ shared post_slack_message tool to deliver the final answer.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Callable
 
@@ -18,8 +19,11 @@ from cuga import CugaAgent, CugaSupervisor
 from dotenv import load_dotenv
 
 from .retrieve import hr_retrieve, it_retrieve, hybrid_retrieve
+from .db import get_github_login
 
 load_dotenv()
+
+log = logging.getLogger("ask_buddy.agent")
 
 # ---------------------------------------------------------------------------
 # System prompts — one per domain agent
@@ -157,6 +161,9 @@ number, and what to change. If anything is ambiguous, ask first.
 happens automatically via Slack; just call the tool.
 - Never claim an action succeeded unless the tool result confirms it. Relay \
 errors plainly.
+- If the user asks to assign something "to me", call resolve_my_github_login \
+first to get their actual GitHub login — never guess or use their Slack \
+display name as a GitHub login.
 
 == HARD RULES ==
 - Never fabricate issue numbers, titles, authors, or URLs.
@@ -190,6 +197,9 @@ and what to change. If anything is ambiguous, ask first.
 confirmation happens automatically via Slack; just call the tool.
 - Never claim an action succeeded unless the tool result confirms it. Relay \
 errors plainly.
+- If the user asks to assign something "to me" or request "me" as a reviewer, \
+call resolve_my_github_login first to get their actual GitHub login — never \
+guess or use their Slack display name as a GitHub login.
 
 == HARD RULES ==
 - Never fabricate PR numbers, reviewers, verdicts, or check results.
@@ -215,11 +225,13 @@ encryption, helpdesk).
 reminders posted to Slack channels (e.g. "remind #channel to do X every \
 day at 9am").
 
-  • git_issue_agent — READ-ONLY questions about GitHub issues (list/summarize \
-issues, labels, assignees, search issues) for a given 'owner/repo'.
+  • git_issue_agent — GitHub issue questions and write actions (list/summarize \
+issues, labels, assignees, search; also comment, label, assign, open/close with \
+confirmation) for a given 'owner/repo'.
 
-  • git_pr_agent — READ-ONLY questions about GitHub pull requests (list/summarize \
-PRs, review status, requested reviewers, CI check results) for a given 'owner/repo'.
+  • git_pr_agent — GitHub pull request questions and write actions (list/summarize \
+PRs, review status, CI checks; also comment, label, assign, request reviewers, \
+merge/close with confirmation) for a given 'owner/repo'.
 
 When a user asks a question or gives a command:
 1. Determine which agent it belongs to and delegate to it.
@@ -234,8 +246,9 @@ reach out to the appropriate team for help.
 5. GitHub *issue* questions go to git_issue_agent; GitHub *pull request* / PR / \
 review / CI-check questions go to git_pr_agent. If a git question needs both \
 (e.g. "summarize all activity on repo X"), delegate to both and combine. \
-Ask Buddy's git access is READ-ONLY — if a user asks to create/close/merge \
-anything, explain that plainly instead of delegating.
+Write actions (comment, label, assign, close/merge) go to the respective git \
+agent — high-risk actions (close/merge) will request Slack confirmation \
+automatically before executing.
 
 Always deliver the final answer via post_slack_message.
 """
@@ -244,6 +257,20 @@ Always deliver the final answer via post_slack_message.
 # ---------------------------------------------------------------------------
 # Few-shot injection (shared, opt-in)
 # ---------------------------------------------------------------------------
+
+def _default_repo_block() -> str:
+    """Optional prompt snippet naming a default repo, so users don't have
+    to type 'owner/repo' on every git question."""
+    repo = os.environ.get("GITHUB_DEFAULT_REPO", "").strip()
+    if not repo:
+        return ""
+    return (
+        f"\n\n== DEFAULT REPOSITORY ==\n"
+        f"If the user's question doesn't name a repo, assume '{repo}'. "
+        f"Only ask which repo they mean if the question is clearly about a "
+        f"different project even with that default in mind."
+    )
+
 
 def _fewshot_block() -> str:
     try:
@@ -572,51 +599,89 @@ def _build_git_dangerous_tools():
     return set_issue_state, merge_pull_request
 
 
-def build_git_issue_agent(slack_post_fn: Callable[[str, str], None]) -> CugaAgent:
+def _build_git_identity_tools(slack_user_id: str | None):
+    from langchain_core.tools import tool
+
+    @tool
+    def resolve_my_github_login() -> str:
+        """Return the GitHub login linked to the Slack user who sent this
+        message. Use this before assigning/requesting review 'to me'. If it
+        returns an error, tell the user to run '/askbuddy link github
+        <login>' first — do not guess a login."""
+        if not slack_user_id:
+            return "error: no Slack user context available for this request."
+        login = get_github_login(slack_user_id)
+        if not login:
+            return (
+                "error: this Slack user hasn't linked a GitHub account yet. "
+                "Ask them to run '/askbuddy link github <their-login>'."
+            )
+        return login
+
+    return (resolve_my_github_login,)
+
+
+def build_git_issue_agent(slack_post_fn: Callable[[str, str], None],
+                          user_id: str | None = None) -> CugaAgent:
     import asyncio
     post_tool = _build_post_tool(slack_post_fn)
     list_issues, get_issue, search_issues = _build_git_issue_tools()
     add_comment, add_labels_tool, assign_tool, _ = _build_git_write_tools()
     set_state_tool, _ = _build_git_dangerous_tools()
+    (resolve_login,) = _build_git_identity_tools(user_id)
     agent = CugaAgent(
         tools=[list_issues, get_issue, search_issues,
                add_comment, add_labels_tool, assign_tool, set_state_tool,
-               post_tool],
+               resolve_login, post_tool],
         enable_knowledge=False,
-        special_instructions=GIT_ISSUE_SYSTEM_PROMPT,
+        special_instructions=GIT_ISSUE_SYSTEM_PROMPT + _default_repo_block(),
     )
-    asyncio.run(agent.policies.add_tool_approval(
-        name="Approve issue state change",
-        required_tools=["set_issue_state"],
-        approval_message="This will close or reopen the issue on GitHub. Confirm?",
-    ))
+    try:
+        asyncio.run(agent.policies.add_tool_approval(
+            name="Approve issue state change",
+            required_tools=["set_issue_state"],
+            approval_message="This will close or reopen the issue on GitHub. Confirm?",
+            policy_id="git_issue_state_approval",
+        ))
+    except Exception:
+        log.debug("git_issue_state_approval policy already registered", exc_info=True)
     return agent
 
 
-def build_git_pr_agent(slack_post_fn: Callable[[str, str], None]) -> CugaAgent:
+def build_git_pr_agent(slack_post_fn: Callable[[str, str], None],
+                       user_id: str | None = None) -> CugaAgent:
     import asyncio
     post_tool = _build_post_tool(slack_post_fn)
     (list_prs, get_pr, get_reviews, get_checks,
      get_files, get_merge_status) = _build_git_pr_tools()
     add_comment, add_labels_tool, assign_tool, request_reviewers_tool = _build_git_write_tools()
     set_state_tool, merge_tool = _build_git_dangerous_tools()
+    (resolve_login,) = _build_git_identity_tools(user_id)
     agent = CugaAgent(
         tools=[list_prs, get_pr, get_reviews, get_checks, get_files, get_merge_status,
                add_comment, add_labels_tool, assign_tool, request_reviewers_tool,
-               set_state_tool, merge_tool, post_tool],
+               set_state_tool, merge_tool, resolve_login, post_tool],
         enable_knowledge=False,
-        special_instructions=GIT_PR_SYSTEM_PROMPT,
+        special_instructions=GIT_PR_SYSTEM_PROMPT + _default_repo_block(),
     )
-    asyncio.run(agent.policies.add_tool_approval(
-        name="Approve PR merge",
-        required_tools=["merge_pull_request"],
-        approval_message="This will merge the pull request into its base branch. Confirm?",
-    ))
-    asyncio.run(agent.policies.add_tool_approval(
-        name="Approve PR state change",
-        required_tools=["set_issue_state"],
-        approval_message="This will close or reopen the pull request on GitHub. Confirm?",
-    ))
+    try:
+        asyncio.run(agent.policies.add_tool_approval(
+            name="Approve PR merge",
+            required_tools=["merge_pull_request"],
+            approval_message="This will merge the pull request into its base branch. Confirm?",
+            policy_id="git_pr_merge_approval",
+        ))
+    except Exception:
+        log.debug("git_pr_merge_approval policy already registered", exc_info=True)
+    try:
+        asyncio.run(agent.policies.add_tool_approval(
+            name="Approve PR state change",
+            required_tools=["set_issue_state"],
+            approval_message="This will close or reopen the pull request on GitHub. Confirm?",
+            policy_id="git_pr_state_approval",
+        ))
+    except Exception:
+        log.debug("git_pr_state_approval policy already registered", exc_info=True)
     return agent
 
 
@@ -651,8 +716,8 @@ def build_supervisor(
     hr = build_hr_agent(slack_post_fn)
     it = build_it_agent(slack_post_fn)
     scheduler = build_scheduler_agent(slack_post_fn, resolve_channel_fn, created_by)
-    git_issue = build_git_issue_agent(slack_post_fn)
-    git_pr = build_git_pr_agent(slack_post_fn)
+    git_issue = build_git_issue_agent(slack_post_fn, user_id=created_by)
+    git_pr = build_git_pr_agent(slack_post_fn, user_id=created_by)
 
     supervisor = CugaSupervisor(
         agents={
