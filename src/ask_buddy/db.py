@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import threading
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 from contextlib import contextmanager
 
 
@@ -115,10 +117,38 @@ def _dsn() -> str:
     return dsn
 
 
+# ---------------------------------------------------------------------------
+# Connection pool — shared across all threads in the bot process.
+# Initialised lazily on first use so the module is importable without a DB.
+# ---------------------------------------------------------------------------
+
+_pool: psycopg2.pool.ThreadedConnectionPool | None = None
+_pool_lock = threading.Lock()
+
+_POOL_MIN = 2
+_POOL_MAX = int(os.environ.get("ASK_BUDDY_DB_POOL_MAX", "10"))
+
+
+def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
+    global _pool
+    if _pool is None:
+        with _pool_lock:
+            if _pool is None:   # double-checked locking
+                _pool = psycopg2.pool.ThreadedConnectionPool(
+                    _POOL_MIN, _POOL_MAX,
+                    _dsn(),
+                    cursor_factory=psycopg2.extras.RealDictCursor,
+                )
+    return _pool
+
+
 @contextmanager
 def get_conn():
-    """Yield a psycopg2 connection with autocommit disabled."""
-    conn = psycopg2.connect(_dsn(), cursor_factory=psycopg2.extras.RealDictCursor)
+    """Yield a pooled psycopg2 connection with autocommit disabled.
+    Returns the connection to the pool on exit (commit on success,
+    rollback on exception)."""
+    pool = _get_pool()
+    conn = pool.getconn()
     try:
         yield conn
         conn.commit()
@@ -126,7 +156,7 @@ def get_conn():
         conn.rollback()
         raise
     finally:
-        conn.close()
+        pool.putconn(conn)
 
 
 def init_schema() -> None:
@@ -192,6 +222,8 @@ def init_schema() -> None:
     """ + _REMINDERS_TABLE_DDL + """
     -- Git watch state for proactive triage dedup
     """ + _GIT_WATCH_TABLE_DDL + """
+    -- Slack user -> GitHub login identity mapping
+    """ + _GIT_IDENTITIES_TABLE_DDL + """
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
