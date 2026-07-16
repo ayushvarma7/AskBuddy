@@ -145,7 +145,8 @@ GIT_ISSUE_SYSTEM_PROMPT = """\
 You are the Git Issue Agent within Ask Buddy. You handle GitHub issues.
 
 You have READ tools (list_issues, get_issue, search_issues) and WRITE tools \
-(add_issue_comment, add_labels, assign_users, set_issue_state).
+(create_issue, add_issue_comment, add_labels, remove_label, assign_users, \
+unassign_users, set_issue_state).
 
 == PROCESS ==
 1. Identify the repository as 'owner/name'. If missing, ask via post_slack_message.
@@ -176,8 +177,8 @@ You are the Git PR Agent within Ask Buddy. You handle GitHub pull requests.
 
 You have READ tools (list_pull_requests, get_pull_request, get_pr_reviews, \
 get_pr_checks, get_pr_files, get_pr_merge_status) and WRITE tools \
-(add_issue_comment, add_labels, assign_users, request_pr_reviewers, \
-set_issue_state, merge_pull_request).
+(create_pull_request, add_issue_comment, add_labels, remove_label, assign_users, \
+unassign_users, request_pr_reviewers, set_issue_state, merge_pull_request).
 
 == PROCESS ==
 1. Identify the repository as 'owner/name'; ask if missing.
@@ -534,7 +535,8 @@ def _build_git_pr_tools():
 
 
 def _build_git_write_tools():
-    """Low-risk write tools: comment, label, assign, request review.
+    """Low-risk write tools: comment, label/remove-label, assign/unassign,
+    request review, create issue/PR.
     Not approval-gated — easily reversible, low blast radius."""
     from langchain_core.tools import tool
     from . import github_client as gh
@@ -556,10 +558,26 @@ def _build_git_write_tools():
             return [f"error: {e}"]
 
     @tool
+    def remove_label(repo: str, number: int, label: str) -> dict:
+        """Remove a single label from an issue or PR in 'owner/repo'."""
+        try:
+            return gh.remove_label(repo, number, label)
+        except gh.GitHubError as e:
+            return {"error": str(e)}
+
+    @tool
     def assign_users(repo: str, number: int, assignees: list[str]) -> list[str]:
         """Assign GitHub users (by login) to an issue or PR."""
         try:
             return gh.assign_users(repo, number, assignees)
+        except gh.GitHubError as e:
+            return [f"error: {e}"]
+
+    @tool
+    def unassign_users(repo: str, number: int, assignees: list[str]) -> list[str]:
+        """Remove GitHub users (by login) from an issue or PR's assignee list."""
+        try:
+            return gh.unassign_users(repo, number, assignees)
         except gh.GitHubError as e:
             return [f"error: {e}"]
 
@@ -571,7 +589,31 @@ def _build_git_write_tools():
         except gh.GitHubError as e:
             return [f"error: {e}"]
 
-    return add_issue_comment, add_labels, assign_users, request_pr_reviewers
+    @tool
+    def create_issue(repo: str, title: str, body: str = "",
+                     labels: list[str] | None = None,
+                     assignees: list[str] | None = None) -> dict:
+        """Create a new GitHub issue in 'owner/repo'. Returns number, url, state."""
+        try:
+            return gh.create_issue(repo, title, body=body,
+                                   labels=labels, assignees=assignees)
+        except gh.GitHubError as e:
+            return {"error": str(e)}
+
+    @tool
+    def create_pull_request(repo: str, title: str, head: str, base: str,
+                            body: str = "", draft: bool = False) -> dict:
+        """Open a new pull request from head -> base in 'owner/repo'.
+        head: source branch (or 'fork:branch'). Returns trimmed PR dict."""
+        try:
+            return gh.create_pull_request(repo, title, head, base,
+                                          body=body, draft=draft)
+        except gh.GitHubError as e:
+            return {"error": str(e)}
+
+    return (add_issue_comment, add_labels, remove_label,
+            assign_users, unassign_users, request_pr_reviewers,
+            create_issue, create_pull_request)
 
 
 def _build_git_dangerous_tools():
@@ -626,13 +668,17 @@ def build_git_issue_agent(slack_post_fn: Callable[[str, str], None],
     import asyncio
     post_tool = _build_post_tool(slack_post_fn)
     list_issues, get_issue, search_issues = _build_git_issue_tools()
-    add_comment, add_labels_tool, assign_tool, _ = _build_git_write_tools()
+    (add_comment, add_labels_tool, remove_label_tool,
+     assign_tool, unassign_tool, _request_reviewers,
+     create_issue_tool, _create_pr) = _build_git_write_tools()
     set_state_tool, _ = _build_git_dangerous_tools()
     (resolve_login,) = _build_git_identity_tools(user_id)
     agent = CugaAgent(
         tools=[list_issues, get_issue, search_issues,
-               add_comment, add_labels_tool, assign_tool, set_state_tool,
-               resolve_login, post_tool],
+               create_issue_tool, add_comment,
+               add_labels_tool, remove_label_tool,
+               assign_tool, unassign_tool,
+               set_state_tool, resolve_login, post_tool],
         enable_knowledge=False,
         special_instructions=GIT_ISSUE_SYSTEM_PROMPT + _default_repo_block(),
     )
@@ -654,12 +700,16 @@ def build_git_pr_agent(slack_post_fn: Callable[[str, str], None],
     post_tool = _build_post_tool(slack_post_fn)
     (list_prs, get_pr, get_reviews, get_checks,
      get_files, get_merge_status) = _build_git_pr_tools()
-    add_comment, add_labels_tool, assign_tool, request_reviewers_tool = _build_git_write_tools()
+    (add_comment, add_labels_tool, remove_label_tool,
+     assign_tool, unassign_tool, request_reviewers_tool,
+     _create_issue, create_pr_tool) = _build_git_write_tools()
     set_state_tool, merge_tool = _build_git_dangerous_tools()
     (resolve_login,) = _build_git_identity_tools(user_id)
     agent = CugaAgent(
         tools=[list_prs, get_pr, get_reviews, get_checks, get_files, get_merge_status,
-               add_comment, add_labels_tool, assign_tool, request_reviewers_tool,
+               create_pr_tool, add_comment,
+               add_labels_tool, remove_label_tool,
+               assign_tool, unassign_tool, request_reviewers_tool,
                set_state_tool, merge_tool, resolve_login, post_tool],
         enable_knowledge=False,
         special_instructions=GIT_PR_SYSTEM_PROMPT + _default_repo_block(),
