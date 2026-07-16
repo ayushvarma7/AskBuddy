@@ -293,22 +293,35 @@ about a past version.
 
 ---
 
-## 5. Git Agent (Read-Only GitHub Integration)
+## 5. Git Agent (GitHub Integration)
 
-Ask Buddy can answer questions about GitHub issues and pull requests and
-proactively post new-item summaries to a triage Slack channel.
+Ask Buddy can answer questions about GitHub issues and pull requests, take
+write actions on them (with confirmation for anything hard to undo), and
+proactively post triage summaries and daily digests to Slack.
 
-### What it answers
+### What it answers (read-only)
 
 - *"List open issues in acme/backend"*
 - *"Summarize issue #42 in acme/frontend"*
 - *"Is PR #17 ready to merge in acme/backend?"* (draft flag + review
-  verdicts + CI check results)
+  verdicts + CI check results, via a single combined verdict)
+- *"What files does PR #17 change?"*
 - *"What PRs are waiting for review in acme/frontend?"*
 
-All access is **read-only**. Ask Buddy cannot create, close, comment on,
-merge, or approve anything — enforced both by the PAT's read-only scopes
-and by the absence of write tools in the agents.
+### What it can do (write actions)
+
+- **Low-risk, no confirmation needed:** comment on an issue/PR, add labels,
+  assign users, request PR reviewers.
+- **High-risk, requires your confirmation in Slack:** close/reopen an issue
+  or PR, merge a PR. Ask Buddy will post a message with **✅ Confirm** /
+  **❌ Cancel** buttons before anything happens on GitHub — nothing merges
+  or closes without an explicit click. Unconfirmed requests expire after 30
+  minutes.
+
+Write actions require the configured `GITHUB_TOKEN` to have **Read-and-write**
+permission on Issues and Pull requests (see the PAT setup note below) — a
+read-only token will cause write attempts to fail with a clear error instead
+of silently doing nothing.
 
 ### Proactive triage
 
@@ -372,6 +385,19 @@ GIT_WATCH_CHANNEL=eng-triage
 # Poll interval in minutes.
 GIT_WATCH_INTERVAL_MINUTES=5
 ```
+
+### Upgrading the PAT for write actions
+
+The original setup used a **Read-only** fine-grained PAT. To enable write
+actions, edit the token (or create a new one) in GitHub → Settings →
+Developer settings → Personal access tokens → Fine-grained tokens, and set:
+
+- **Issues** → Read and write
+- **Pull requests** → Read and write
+
+Read-only tokens still work for everything in "What it answers" — write
+actions will just fail with a clear "GitHub write permission error" message
+instead of the write silently not happening.
 
 ---
 
