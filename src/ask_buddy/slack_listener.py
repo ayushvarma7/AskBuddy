@@ -14,12 +14,15 @@ Required environment variables (set in .env):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
 import sys
 import threading
+import time
 import traceback
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from slack_bolt import App
@@ -86,6 +89,14 @@ try:
 except Exception as _e:
     log.warning("Could not initialise git-watch schema: %s", _e)
 
+# Ensure the git-identities table exists at startup (idempotent)
+try:
+    from .db import init_git_identities_schema
+    init_git_identities_schema()
+    log.info("ask_buddy_git_identities table ready.")
+except Exception as _e:
+    log.warning("Could not initialise git-identities schema: %s", _e)
+
 
 # ---------------------------------------------------------------------------
 # Channel name -> ID resolution (needed by the scheduler_agent's reminder
@@ -94,6 +105,92 @@ except Exception as _e:
 
 _CHANNEL_ID_RE = re.compile(r"^[CGD][A-Z0-9]{8,}$")
 _channel_name_to_id: dict[str, str] = {}
+
+# ---------------------------------------------------------------------------
+# Pending GitHub write-action approvals
+#
+# A ToolApproval-gated tool (merge_pull_request, set_issue_state) pauses the
+# CugaSupervisor's graph instead of running. The paused supervisor uses an
+# in-memory checkpointer (see cuga/sdk.py CugaSupervisor.graph) — resuming
+# MUST reuse the exact same supervisor object, so we keep it alive here,
+# keyed by thread_id, until the user clicks Confirm/Cancel in Slack.
+# ---------------------------------------------------------------------------
+
+PAUSED_MARKER = "Execution paused for approval"
+_APPROVAL_TTL_SECONDS = 30 * 60  # 30 minutes
+
+_pending_approvals: dict[str, dict] = {}
+_pending_approvals_lock = threading.Lock()
+
+
+def _stash_pending_approval(thread_id: str, supervisor, channel: str, user_text: str,
+                            agent_config: str, retrieved_chunk_ids: list[int]) -> None:
+    with _pending_approvals_lock:
+        _pending_approvals[thread_id] = {
+            "supervisor": supervisor,
+            "channel": channel,
+            "user_text": user_text,
+            "agent_config": agent_config,
+            "retrieved_chunk_ids": list(retrieved_chunk_ids),
+            "created_at": time.time(),
+        }
+
+
+def _pop_pending_approval(thread_id: str) -> dict | None:
+    with _pending_approvals_lock:
+        return _pending_approvals.pop(thread_id, None)
+
+
+def _sweep_expired_approvals() -> None:
+    now = time.time()
+    with _pending_approvals_lock:
+        expired = [tid for tid, v in _pending_approvals.items()
+                   if now - v["created_at"] > _APPROVAL_TTL_SECONDS]
+        for tid in expired:
+            del _pending_approvals[tid]
+    if expired:
+        log.info("[git_approval] swept %d expired pending approval(s)", len(expired))
+
+
+def _start_approval_sweep() -> None:
+    from apscheduler.schedulers.background import BackgroundScheduler
+    from apscheduler.triggers.interval import IntervalTrigger
+    sweep_scheduler = BackgroundScheduler()
+    sweep_scheduler.add_job(
+        _sweep_expired_approvals,
+        trigger=IntervalTrigger(minutes=5),
+        id="git-approval-sweep",
+        replace_existing=True,
+    )
+    sweep_scheduler.start()
+    log.info("[git_approval] pending-approval sweep started (TTL=%ds)", _APPROVAL_TTL_SECONDS)
+
+
+def _build_approval_blocks(thread_id: str, prompt_text: str) -> list[dict]:
+    payload = json.dumps({"thread_id": thread_id})
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": prompt_text}},
+        {
+            "type": "actions",
+            "block_id": f"git_approval_{thread_id}",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "✅ Confirm", "emoji": True},
+                    "style": "primary",
+                    "action_id": "git_approval_confirm",
+                    "value": payload,
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "❌ Cancel", "emoji": True},
+                    "style": "danger",
+                    "action_id": "git_approval_deny",
+                    "value": payload,
+                },
+            ],
+        },
+    ]
 
 
 def _refresh_channel_cache() -> None:
@@ -159,6 +256,12 @@ try:
     start_git_digest(_plain_post)
 except Exception as _e:
     log.warning("Could not start git digest: %s", _e)
+
+# Sweep pending GitHub write-action approvals that were never confirmed
+try:
+    _start_approval_sweep()
+except Exception as _e:
+    log.warning("Could not start approval sweep: %s", _e)
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +376,25 @@ def _run_agent_for_message(user_text: str, channel: str, user: str,
                  (getattr(result, "answer", None) or "")[:120])
 
         answer = getattr(result, "answer", None)
+
+        if answer and PAUSED_MARKER in answer:
+            thread_id = f"slack-{channel}-{user}"
+            _stash_pending_approval(
+                thread_id, supervisor, channel, user_text,
+                agent_config, retrieved_chunk_ids,
+            )
+            blocks = _build_approval_blocks(
+                thread_id,
+                "⚠️ *This action needs your confirmation before it runs on "
+                "GitHub* (e.g. merging a pull request or closing an issue).",
+            )
+            app.client.chat_postMessage(
+                channel=channel,
+                text="Confirmation needed before this action runs.",
+                blocks=blocks,
+            )
+            return
+
         if answer and not posted_answers:
             _post(channel, answer)
 
@@ -372,6 +494,21 @@ def handle_slash_command(ack, command, respond):
         respond("⏳ Fetching repo digest…")
         t = threading.Thread(target=_run_digest, daemon=True)
         t.start()
+        return
+
+    # /askbuddy link github <login>
+    if lower.startswith("link github "):
+        github_login = user_text.split(None, 2)[2].strip().lstrip("@")
+        if not github_login:
+            respond("Usage: `/askbuddy link github <your-github-username>`")
+            return
+        from .db import link_github_identity
+        try:
+            link_github_identity(user, github_login)
+            respond(f"✅ Linked your Slack account to GitHub user `{github_login}`.")
+        except Exception:
+            log.exception("[git_identity] failed to link %s -> %s", user, github_login)
+            respond("⚠️ Could not save that link — check bot logs.")
         return
 
     # ---------------------------------------------------------------------------
@@ -516,6 +653,120 @@ def handle_reason_submission(ack, body, view, logger):
         message_ts=meta["message_ts"],
         reason=reason,
     )
+
+
+# ---------------------------------------------------------------------------
+# GitHub write-action approval handlers (merge / close / reopen confirmation)
+# ---------------------------------------------------------------------------
+
+@app.action("git_approval_confirm")
+def handle_git_approval_confirm(body, ack):
+    ack()
+    _handle_git_approval(body, confirmed=True)
+
+
+@app.action("git_approval_deny")
+def handle_git_approval_deny(body, ack):
+    ack()
+    _handle_git_approval(body, confirmed=False)
+
+
+def _handle_git_approval(body: dict, confirmed: bool) -> None:
+    action = body["actions"][0]
+    try:
+        thread_id = json.loads(action["value"])["thread_id"]
+    except (KeyError, json.JSONDecodeError):
+        log.warning("[git_approval] could not parse action value: %r", action.get("value"))
+        return
+
+    channel = body["channel"]["id"]
+    message_ts = body["message"]["ts"]
+    user_id = body["user"]["id"]
+
+    pending = _pop_pending_approval(thread_id)
+    if pending is None:
+        app.client.chat_update(
+            channel=channel, ts=message_ts,
+            text="This approval has expired or was already handled.",
+            blocks=[{"type": "section", "text": {
+                "type": "mrkdwn",
+                "text": "_This approval has expired or was already handled._",
+            }}],
+        )
+        return
+
+    verb = "Confirmed" if confirmed else "Cancelled"
+    app.client.chat_update(
+        channel=channel, ts=message_ts,
+        text=f"{verb} — processing…",
+        blocks=[{"type": "section", "text": {
+            "type": "mrkdwn", "text": f"_{verb} by <@{user_id}> — processing…_",
+        }}],
+    )
+
+    t = threading.Thread(
+        target=_resume_after_approval,
+        args=(pending, thread_id, confirmed, channel, user_id),
+        daemon=True,
+    )
+    t.start()
+
+
+def _resume_after_approval(pending: dict, thread_id: str, confirmed: bool,
+                           channel: str, user_id: str) -> None:
+    """Resume the SAME paused supervisor object with the user's decision."""
+    from cuga.backend.cuga_graph.nodes.human_in_the_loop.followup_model import (
+        ActionResponse, ActionType,
+    )
+
+    supervisor = pending["supervisor"]
+    approval = ActionResponse(
+        action_id="tool_approval",
+        response_type=ActionType.CONFIRMATION,
+        confirmed=confirmed,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        user_id=user_id,
+        session_id=thread_id,
+    )
+
+    try:
+        result = asyncio.run(
+            supervisor.invoke(None, thread_id=thread_id, action_response=approval)
+        )
+        answer = getattr(result, "answer", None)
+
+        if answer and PAUSED_MARKER in answer:
+            # Chained approval (rare — e.g. two gated tools in one turn).
+            # Stash again and prompt once more instead of dropping it.
+            _stash_pending_approval(
+                thread_id, supervisor, channel,
+                pending["user_text"], pending["agent_config"],
+                pending["retrieved_chunk_ids"],
+            )
+            blocks = _build_approval_blocks(
+                thread_id, "⚠️ *One more confirmation needed before this completes.*",
+            )
+            app.client.chat_postMessage(
+                channel=channel, text="Another confirmation needed.", blocks=blocks,
+            )
+            return
+
+        if not answer:
+            answer = ("Action cancelled — nothing was changed on GitHub."
+                      if not confirmed else "Done.")
+
+        _post_answer_with_feedback(
+            channel, answer, pending["user_text"],
+            retrieved_chunk_ids=pending["retrieved_chunk_ids"],
+            agent_config=pending["agent_config"],
+        )
+    except Exception:
+        log.error("[git_approval] UNHANDLED EXCEPTION resuming thread=%s:\n%s",
+                  thread_id, traceback.format_exc())
+        app.client.chat_postMessage(
+            channel=channel,
+            text="⚠️ Something went wrong completing that action — check the bot logs.",
+        )
 
 
 # ---------------------------------------------------------------------------
