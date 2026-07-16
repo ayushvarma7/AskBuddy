@@ -9,3 +9,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# CUGA local policy/approval storage (per-environment, not shared)
+.cuga/
