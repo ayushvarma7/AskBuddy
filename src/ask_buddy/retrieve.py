@@ -33,16 +33,29 @@ QUALITY_ALPHA = 0.05   # ±5% per net vote
 QUALITY_MAX = 0.30     # ±30% ceiling
 
 
-def _embed_query(query: str) -> list[float]:
+# Module-level embedder singleton — created once on first use, reused for
+# every subsequent retrieve call.  Avoids spinning up a new HTTP client per
+# message.  Protected by a simple check-and-set (the GIL makes this safe for
+# CPython threads without an explicit lock).
+_embedder: Any | None = None
+
+
+def _get_embedder() -> Any:
+    global _embedder
     key = os.environ.get("GOOGLE_API_KEY")
     if not key:
         raise RuntimeError("GOOGLE_API_KEY is not set.")
-    embedder = GoogleGenerativeAIEmbeddings(
-        model=EMBED_MODEL,
-        google_api_key=key,
-        output_dimensionality=768,     # match ingest dimensions
-    )
-    return embedder.embed_query(query)
+    if _embedder is None:
+        _embedder = GoogleGenerativeAIEmbeddings(
+            model=EMBED_MODEL,
+            google_api_key=key,
+            output_dimensionality=768,     # match ingest dimensions
+        )
+    return _embedder
+
+
+def _embed_query(query: str) -> list[float]:
+    return _get_embedder().embed_query(query)
 
 
 def _vector_search(embedding: list[float], pool: int,
