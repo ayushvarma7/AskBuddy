@@ -122,6 +122,57 @@ _APPROVAL_TTL_SECONDS = 30 * 60  # 30 minutes
 _pending_approvals: dict[str, dict] = {}
 _pending_approvals_lock = threading.Lock()
 
+# ---------------------------------------------------------------------------
+# Supervisor cache — one CugaSupervisor per (channel, user), kept alive so
+# the in-memory MemorySaver checkpointer retains conversation history across
+# turns.  Entries are evicted after the same TTL as pending approvals to
+# prevent unbounded growth on idle bots.
+# ---------------------------------------------------------------------------
+
+_supervisor_cache: dict[str, dict] = {}  # thread_id -> {supervisor, last_used}
+_supervisor_cache_lock = threading.Lock()
+_SUPERVISOR_TTL_SECONDS = _APPROVAL_TTL_SECONDS  # 30 minutes idle eviction
+
+
+def _get_or_build_supervisor(thread_id: str, slack_post_fn, resolve_channel_fn,
+                              created_by: str | None):
+    """Return the cached CugaSupervisor for this thread_id, building one if needed."""
+    from .agent import build_supervisor
+    now = time.time()
+    with _supervisor_cache_lock:
+        entry = _supervisor_cache.get(thread_id)
+        if entry:
+            entry["last_used"] = now
+            return entry["supervisor"]
+    # Build outside the lock — supervisor construction is slow and we don't
+    # want to block other threads while it runs.
+    supervisor = build_supervisor(
+        slack_post_fn=slack_post_fn,
+        resolve_channel_fn=resolve_channel_fn,
+        created_by=created_by,
+    )
+    with _supervisor_cache_lock:
+        # Another thread may have built one while we were constructing — let
+        # that one win so we don't accumulate duplicates.
+        existing = _supervisor_cache.get(thread_id)
+        if existing:
+            existing["last_used"] = now
+            return existing["supervisor"]
+        _supervisor_cache[thread_id] = {"supervisor": supervisor, "last_used": now}
+    return supervisor
+
+
+def _evict_idle_supervisors() -> None:
+    """Remove supervisors that haven't been used for _SUPERVISOR_TTL_SECONDS."""
+    now = time.time()
+    with _supervisor_cache_lock:
+        evicted = [tid for tid, v in _supervisor_cache.items()
+                   if now - v["last_used"] > _SUPERVISOR_TTL_SECONDS]
+        for tid in evicted:
+            del _supervisor_cache[tid]
+    if evicted:
+        log.info("[supervisor_cache] evicted %d idle supervisor(s)", len(evicted))
+
 
 def _stash_pending_approval(thread_id: str, supervisor, channel: str, user_text: str,
                             agent_config: str, retrieved_chunk_ids: list[int]) -> None:
@@ -162,35 +213,53 @@ def _start_approval_sweep() -> None:
         id="git-approval-sweep",
         replace_existing=True,
     )
+    sweep_scheduler.add_job(
+        _evict_idle_supervisors,
+        trigger=IntervalTrigger(minutes=5),
+        id="supervisor-cache-evict",
+        replace_existing=True,
+    )
     sweep_scheduler.start()
-    log.info("[git_approval] pending-approval sweep started (TTL=%ds)", _APPROVAL_TTL_SECONDS)
+    log.info("[git_approval] pending-approval sweep + supervisor-cache eviction started "
+             "(TTL=%ds)", _APPROVAL_TTL_SECONDS)
 
 
-def _build_approval_blocks(thread_id: str, prompt_text: str) -> list[dict]:
+def _build_approval_blocks(thread_id: str, prompt_text: str,
+                           action_summary: str = "") -> list[dict]:
     payload = json.dumps({"thread_id": thread_id})
-    return [
+    expires_at = datetime.fromtimestamp(
+        time.time() + _APPROVAL_TTL_SECONDS, tz=timezone.utc
+    ).strftime("%H:%M UTC")
+    footer = f"_Expires at {expires_at}_"
+    if action_summary:
+        footer = f"*Action:* {action_summary}\n{footer}"
+    blocks: list[dict] = [
         {"type": "section", "text": {"type": "mrkdwn", "text": prompt_text}},
-        {
-            "type": "actions",
-            "block_id": f"git_approval_{thread_id}",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "✅ Confirm", "emoji": True},
-                    "style": "primary",
-                    "action_id": "git_approval_confirm",
-                    "value": payload,
-                },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "❌ Cancel", "emoji": True},
-                    "style": "danger",
-                    "action_id": "git_approval_deny",
-                    "value": payload,
-                },
-            ],
-        },
     ]
+    if footer:
+        blocks.append({"type": "context",
+                        "elements": [{"type": "mrkdwn", "text": footer}]})
+    blocks.append({
+        "type": "actions",
+        "block_id": f"git_approval_{thread_id}",
+        "elements": [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "✅ Confirm", "emoji": True},
+                "style": "primary",
+                "action_id": "git_approval_confirm",
+                "value": payload,
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "❌ Cancel", "emoji": True},
+                "style": "danger",
+                "action_id": "git_approval_deny",
+                "value": payload,
+            },
+        ],
+    })
+    return blocks
 
 
 def _refresh_channel_cache() -> None:
@@ -325,15 +394,17 @@ def _post_answer_with_feedback(
 def _run_agent_for_message(user_text: str, channel: str, user: str,
                             thread_ts: str | None = None) -> None:
     """
-    Run the CugaSupervisor in a plain thread.
+    Run the CugaSupervisor in a background thread.
 
-    The supervisor decides whether the query is HR, IT, or cross-domain,
-    then delegates to the appropriate sub-agent(s).
+    Supervisors are cached per (channel, user) so the in-memory MemorySaver
+    checkpointer preserves conversation history across turns.  A separate
+    invoke_id is used for each invocation so concurrent messages from the
+    same user don't clobber each other's checkpoint slot.
     """
     posted_answers: list[str] = []
     retrieved_chunk_ids: list[int] = []
 
-    from src.ask_buddy.agent import current_agent_config
+    from .agent import current_agent_config
     agent_config = current_agent_config()
 
     def _post(ch: str, text: str) -> None:
@@ -343,6 +414,10 @@ def _run_agent_for_message(user_text: str, channel: str, user: str,
             agent_config=agent_config,
         )
         posted_answers.append(text)
+
+    # Stable thread_id per (channel, user) — the supervisor cache key and the
+    # key used for the approval stash after a pause.
+    thread_id = f"slack-{channel}-{user}"
 
     prompt = (
         f"A Slack user (id: {user}) in channel {channel} asks:\n\n"
@@ -355,7 +430,7 @@ def _run_agent_for_message(user_text: str, channel: str, user: str,
              user, channel, user_text[:120])
 
     try:
-        from src.ask_buddy.retrieve import _hybrid_retrieve_core
+        from .retrieve import _hybrid_retrieve_core
         chunks = _hybrid_retrieve_core(user_text, top_k=5)
         if chunks and "error" in chunks[0]:
             raise RuntimeError(f"retrieve error: {chunks[0]['error']}")
@@ -363,14 +438,14 @@ def _run_agent_for_message(user_text: str, channel: str, user: str,
         log.info("[supervisor] pre-retrieved %d chunks: %s",
                  len(chunks), [c.get("source_filename") for c in chunks])
 
-        from src.ask_buddy.agent import build_supervisor
-        supervisor = build_supervisor(
+        supervisor = _get_or_build_supervisor(
+            thread_id,
             slack_post_fn=_post,
             resolve_channel_fn=resolve_channel,
             created_by=user,
         )
         result = asyncio.run(
-            supervisor.invoke(prompt, thread_id=f"slack-{channel}-{user}")
+            supervisor.invoke(prompt, thread_id=thread_id)
         )
         log.info("[supervisor] invoke complete | answer[:120]=%r",
                  (getattr(result, "answer", None) or "")[:120])
@@ -378,7 +453,6 @@ def _run_agent_for_message(user_text: str, channel: str, user: str,
         answer = getattr(result, "answer", None)
 
         if answer and PAUSED_MARKER in answer:
-            thread_id = f"slack-{channel}-{user}"
             _stash_pending_approval(
                 thread_id, supervisor, channel, user_text,
                 agent_config, retrieved_chunk_ids,
@@ -387,6 +461,7 @@ def _run_agent_for_message(user_text: str, channel: str, user: str,
                 thread_id,
                 "⚠️ *This action needs your confirmation before it runs on "
                 "GitHub* (e.g. merging a pull request or closing an issue).",
+                action_summary=user_text[:120],
             )
             app.client.chat_postMessage(
                 channel=channel,
@@ -496,6 +571,57 @@ def handle_slash_command(ack, command, respond):
         t.start()
         return
 
+    # /askbuddy help
+    if lower in ("help", "--help"):
+        respond(
+            "*Ask Buddy — available commands*\n\n"
+            "*HR & IT policy questions* — just ask:\n"
+            "  `/askbuddy how many PTO days do I get?`\n"
+            "  `/askbuddy what's the VPN policy?`\n\n"
+            "*GitHub questions & write actions*\n"
+            "  `/askbuddy list open issues in acme/backend`\n"
+            "  `/askbuddy is PR #17 ready to merge in acme/frontend?`\n"
+            "  `/askbuddy add label bug to issue #5 in acme/backend`\n"
+            "  `/askbuddy merge PR #17 in acme/frontend` _(requires confirmation)_\n\n"
+            "*Reminders*\n"
+            "  `/askbuddy remind #eng-team to submit timecards every Friday at 9am`\n"
+            "  `/askbuddy list reminders in #eng-team`\n"
+            "  `/askbuddy cancel reminder 42`\n\n"
+            "*Subcommands*\n"
+            "  `/askbuddy git digest` — post a full repo state digest now\n"
+            "  `/askbuddy git digest owner/repo` — digest for one specific repo\n"
+            "  `/askbuddy link github <your-login>` — link your GitHub account\n"
+            "  `/askbuddy status` — show watched repos and current watermarks\n"
+            "  `/askbuddy help` — this message"
+        )
+        return
+
+    # /askbuddy status
+    if lower == "status":
+        from .git_watch import _watched_repos
+        from .db import get_git_watermark
+        repos = _watched_repos()
+        if not repos:
+            respond("No repos configured — set `GIT_WATCH_REPOS` in `.env`.")
+            return
+        lines = ["*Ask Buddy — watcher status*\n"]
+        for repo in repos:
+            try:
+                wm = get_git_watermark(repo)
+                iss = wm["last_issue_number"]
+                pr = wm["last_pr_number"]
+                watermark_str = (
+                    f"issue watermark: {iss if iss >= 0 else '_not seeded_'}, "
+                    f"PR watermark: {pr if pr >= 0 else '_not seeded_'}"
+                )
+            except Exception as exc:
+                watermark_str = f"_error reading watermark: {exc}_"
+            lines.append(f"• `{repo}` — {watermark_str}")
+        supervisor_count = len(_supervisor_cache)
+        lines.append(f"\n_Active supervisor sessions: {supervisor_count}_")
+        respond("\n".join(lines))
+        return
+
     # /askbuddy link github <login>
     if lower.startswith("link github "):
         github_login = user_text.split(None, 2)[2].strip().lstrip("@")
@@ -531,7 +657,6 @@ def handle_slash_command(ack, command, respond):
 
 def _parse_response_id(body: dict) -> str | None:
     """Recover the response_id from a feedback button's JSON value payload."""
-    import json
     action = body["actions"][0]
     try:
         return json.loads(action["value"])["response_id"]
@@ -631,7 +756,6 @@ def handle_feedback_negative(body, ack, client):
 @app.view("feedback_reason_submit")
 def handle_reason_submission(ack, body, view, logger):
     """Record the 👎 rating together with the reason chosen in the modal."""
-    import json
     ack()
 
     try:
