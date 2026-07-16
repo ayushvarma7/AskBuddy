@@ -80,11 +80,13 @@ _REMINDERS_TABLE_DDL = """
 # ---------------------------------------------------------------------------
 # last_issue_number / last_pr_number : highest number already reported to Slack.
 #   On each poll we only report items with number > the stored high-water mark.
+#   -1 is the sentinel meaning "never seeded" (a real repo can have 0 PRs,
+#   so 0 is a valid watermark — not a safe sentinel).
 _GIT_WATCH_TABLE_DDL = """
     CREATE TABLE IF NOT EXISTS ask_buddy_git_watch (
         repo               TEXT        PRIMARY KEY,   -- 'owner/name'
-        last_issue_number  INTEGER     NOT NULL DEFAULT 0,
-        last_pr_number     INTEGER     NOT NULL DEFAULT 0,
+        last_issue_number  INTEGER     NOT NULL DEFAULT -1,
+        last_pr_number     INTEGER     NOT NULL DEFAULT -1,
         last_polled_at     TIMESTAMPTZ
     );
 """
@@ -199,7 +201,8 @@ def init_git_watch_schema() -> None:
 
 
 def get_git_watermark(repo: str) -> dict:
-    """Return {'last_issue_number', 'last_pr_number'} for a repo (0/0 if new)."""
+    """Return {'last_issue_number', 'last_pr_number'} for a repo.
+    Returns -1/-1 when the repo has never been polled (sentinel for first-sight)."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -207,7 +210,7 @@ def get_git_watermark(repo: str) -> dict:
                 "FROM ask_buddy_git_watch WHERE repo = %s;", (repo,))
             row = cur.fetchone()
             if row is None:
-                return {"last_issue_number": 0, "last_pr_number": 0}
+                return {"last_issue_number": -1, "last_pr_number": -1}
             return {"last_issue_number": row["last_issue_number"],
                     "last_pr_number": row["last_pr_number"]}
 

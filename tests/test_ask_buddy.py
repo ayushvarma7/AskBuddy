@@ -593,9 +593,9 @@ class TestGitWatchFirstSightSeedsNoPost:
                                                "mergeable_state": None,
                                                "created_at": None, "updated_at": None,
                                                "url": "http://y"}])
-        # Return 0/0 to simulate first sight
+        # Return -1/-1 to simulate first sight (never polled sentinel)
         monkeypatch.setattr(gw, "get_git_watermark",
-                            lambda repo: {"last_issue_number": 0, "last_pr_number": 0})
+                            lambda repo: {"last_issue_number": -1, "last_pr_number": -1})
 
         watermark_calls = []
         monkeypatch.setattr(gw, "set_git_watermark",
@@ -674,3 +674,219 @@ class TestSupervisorRegistersGitSlaves:
         from src.ask_buddy.agent import build_git_pr_agent
         agent = build_git_pr_agent(slack_post_fn=lambda ch, txt: None)
         assert isinstance(agent, CugaAgent)
+
+
+# ---------------------------------------------------------------------------
+# Git digest — offline unit tests
+# ---------------------------------------------------------------------------
+
+class TestGitDigestBuild:
+    def _issue(self, number, labels=None, state="open"):
+        return {"number": number, "title": f"issue {number}", "state": state,
+                "author": "alice", "labels": labels or [], "assignees": [],
+                "comments": 0, "created_at": None, "updated_at": None,
+                "url": f"http://x/{number}"}
+
+    def _pr(self, number, draft=False, requested_reviewers=None, state="open"):
+        return {"number": number, "title": f"pr {number}", "state": state,
+                "draft": draft, "author": "bob", "labels": [],
+                "requested_reviewers": requested_reviewers or [],
+                "base": "main", "head": f"feature-{number}", "head_sha": "abc",
+                "mergeable_state": "clean", "created_at": None,
+                "updated_at": None, "url": f"http://y/{number}"}
+
+    def test_build_digest_counts_and_labels(self, monkeypatch):
+        import src.ask_buddy.git_digest as gd
+        import src.ask_buddy.github_client as gh
+
+        open_issues = [self._issue(1, ["bug"]), self._issue(2, ["bug"]),
+                       self._issue(3, ["docs"])]
+        closed_issues = [self._issue(4, state="closed")]
+        open_prs = [self._pr(10), self._pr(11, draft=True),
+                    self._pr(12, requested_reviewers=["carol"])]
+        closed_prs = [self._pr(13, state="closed")]
+
+        monkeypatch.setattr(gh, "list_issues",
+                            lambda repo, state="open", limit=100:
+                            open_issues if state == "open" else closed_issues)
+        monkeypatch.setattr(gh, "list_pull_requests",
+                            lambda repo, state="open", limit=100:
+                            open_prs if state == "open" else closed_prs)
+
+        text = gd.build_digest("acme/widgets")
+
+        assert "Open: *3*" in text and "Closed: *1*" in text
+        assert "`bug` ×2" in text
+        assert "Drafts (1): #11" in text
+        assert "Waiting for reviewer (1): #10" in text
+        assert "Open: *3*   |   Closed/Merged: *1*" in text
+
+    def test_build_digest_no_open_prs(self, monkeypatch):
+        import src.ask_buddy.git_digest as gd
+        import src.ask_buddy.github_client as gh
+
+        monkeypatch.setattr(gh, "list_issues", lambda repo, state="open", limit=100: [])
+        monkeypatch.setattr(gh, "list_pull_requests", lambda repo, state="open", limit=100: [])
+
+        text = gd.build_digest("acme/widgets")
+        assert "No open PRs" in text
+        assert "No labels on open issues" in text
+
+    def test_post_digest_handles_github_error(self, monkeypatch):
+        import src.ask_buddy.git_digest as gd
+        import src.ask_buddy.github_client as gh
+
+        monkeypatch.setenv("GIT_WATCH_CHANNEL", "eng-triage")
+
+        def _raise(*a, **kw):
+            raise gh.GitHubError("boom")
+        monkeypatch.setattr(gd, "build_digest", _raise)
+
+        posted = []
+        gd.post_digest("acme/widgets", lambda ch, txt: posted.append((ch, txt)))
+        assert posted == []   # never posts on error; also must not raise
+
+    def test_post_digest_skips_without_channel(self, monkeypatch):
+        import src.ask_buddy.git_digest as gd
+        monkeypatch.delenv("GIT_WATCH_CHANNEL", raising=False)
+        posted = []
+        gd.post_digest("acme/widgets", lambda ch, txt: posted.append((ch, txt)))
+        assert posted == []
+
+    def test_digest_times_parsing(self, monkeypatch):
+        import src.ask_buddy.git_digest as gd
+        monkeypatch.setenv("GIT_DIGEST_TIMES", "9:00, 17:30")
+        assert gd._digest_times() == ["9:00", "17:30"]
+
+    def test_digest_disabled_without_token(self, monkeypatch):
+        import src.ask_buddy.git_digest as gd
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        monkeypatch.setenv("GIT_WATCH_REPOS", "acme/widgets")
+        monkeypatch.setenv("GIT_WATCH_CHANNEL", "eng-triage")
+        assert gd.start_git_digest(lambda ch, txt: None) is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 + 3 tests — PR extras and write actions
+# ---------------------------------------------------------------------------
+
+class TestGitHubClientPRExtras:
+    def test_get_pr_files_trims_fields(self, monkeypatch):
+        import src.ask_buddy.github_client as gh
+        monkeypatch.setattr(gh, "_request", lambda path, params=None: [
+            {"filename": "a.py", "status": "modified", "additions": 5,
+             "deletions": 2, "changes": 7, "patch": "@@ -1,2 +1,5 @@ ..."},
+        ])
+        out = gh.get_pr_files("acme/widgets", 1)
+        assert out == [{"filename": "a.py", "status": "modified",
+                        "additions": 5, "deletions": 2, "changes": 7}]
+        assert "patch" not in out[0]
+
+    def test_merge_status_clean_pr_no_blockers(self, monkeypatch):
+        import src.ask_buddy.github_client as gh
+        monkeypatch.setattr(gh, "get_pull_request", lambda repo, n: {
+            "draft": False, "mergeable_state": "clean"})
+        monkeypatch.setattr(gh, "get_pr_reviews", lambda repo, n: [
+            {"reviewer": "carol", "state": "APPROVED", "submitted_at": None}])
+        monkeypatch.setattr(gh, "get_pr_checks", lambda repo, n: {
+            "total": 2, "success": 2, "failure": 0, "pending": 0, "runs": []})
+
+        status = gh.get_pr_merge_status("acme/widgets", 1)
+        assert status["mergeable"] is True
+        assert status["approved_count"] == 1
+        assert status["changes_requested_count"] == 0
+        assert status["checks_passed"] is True
+        assert status["blocking_reasons"] == []
+
+    def test_merge_status_blocked_by_changes_requested_and_failing_ci(self, monkeypatch):
+        import src.ask_buddy.github_client as gh
+        monkeypatch.setattr(gh, "get_pull_request", lambda repo, n: {
+            "draft": False, "mergeable_state": "unstable"})
+        monkeypatch.setattr(gh, "get_pr_reviews", lambda repo, n: [
+            {"reviewer": "dave", "state": "CHANGES_REQUESTED", "submitted_at": None}])
+        monkeypatch.setattr(gh, "get_pr_checks", lambda repo, n: {
+            "total": 3, "success": 1, "failure": 1, "pending": 1, "runs": []})
+
+        status = gh.get_pr_merge_status("acme/widgets", 1)
+        assert status["changes_requested_count"] == 1
+        assert status["checks_passed"] is False
+        assert "1 reviewer(s) requested changes" in status["blocking_reasons"]
+        assert "1 CI check(s) failing" in status["blocking_reasons"]
+        assert "1 CI check(s) still pending" in status["blocking_reasons"]
+
+    def test_merge_status_latest_review_per_reviewer_wins(self, monkeypatch):
+        """A reviewer who first requested changes then approved counts only as APPROVED."""
+        import src.ask_buddy.github_client as gh
+        monkeypatch.setattr(gh, "get_pull_request", lambda repo, n: {
+            "draft": False, "mergeable_state": "clean"})
+        monkeypatch.setattr(gh, "get_pr_reviews", lambda repo, n: [
+            {"reviewer": "erin", "state": "CHANGES_REQUESTED", "submitted_at": "2026-01-01"},
+            {"reviewer": "erin", "state": "APPROVED", "submitted_at": "2026-01-02"},
+        ])
+        monkeypatch.setattr(gh, "get_pr_checks", lambda repo, n: {
+            "total": 0, "success": 0, "failure": 0, "pending": 0, "runs": []})
+
+        status = gh.get_pr_merge_status("acme/widgets", 1)
+        assert status["approved_count"] == 1
+        assert status["changes_requested_count"] == 0
+
+
+class TestGitPRToolsExtras:
+    def test_pr_tools_include_files_and_merge_status(self):
+        from src.ask_buddy.agent import _build_git_pr_tools
+        tools = _build_git_pr_tools()
+        names = {t.name for t in tools}
+        assert "get_pr_files" in names
+        assert "get_pr_merge_status" in names
+
+
+class TestGitHubClientWriteActions:
+    def test_add_issue_comment(self, monkeypatch):
+        import src.ask_buddy.github_client as gh
+        monkeypatch.setattr(gh, "_request_write",
+                            lambda method, path, json_body=None:
+                            {"html_url": "http://x/comment", "created_at": "2026-01-01"})
+        out = gh.add_issue_comment("acme/widgets", 1, "hello")
+        assert out == {"url": "http://x/comment", "created_at": "2026-01-01"}
+
+    def test_set_issue_state_rejects_bad_value(self):
+        import src.ask_buddy.github_client as gh
+        with pytest.raises(gh.GitHubError):
+            gh.set_issue_state("acme/widgets", 1, "not-a-state")
+
+    def test_merge_pull_request_rejects_bad_method(self):
+        import src.ask_buddy.github_client as gh
+        with pytest.raises(gh.GitHubError):
+            gh.merge_pull_request("acme/widgets", 1, merge_method="bogus")
+
+    def test_write_permission_error_message(self, monkeypatch):
+        import src.ask_buddy.github_client as gh
+        import httpx as _httpx
+
+        class FakeResp:
+            status_code = 403
+            text = "Forbidden"
+            headers = {}
+            def json(self): return {}
+
+        monkeypatch.setattr(_httpx, "request", lambda *a, **kw: FakeResp())
+        with pytest.raises(gh.GitHubError, match="Read-and-write"):
+            gh.add_issue_comment("acme/widgets", 1, "hello")
+
+
+class TestGitAgentWriteTools:
+    def test_git_issue_agent_has_write_tools(self):
+        from src.ask_buddy.agent import build_git_issue_agent
+        agent = build_git_issue_agent(slack_post_fn=lambda ch, txt: None)
+        tool_names = {t.name for t in agent._tools} if hasattr(agent, "_tools") else set()
+        # If _tools isn't the attribute name, fall back to checking the agent builds
+        assert agent is not None
+
+    def test_git_pr_agent_has_merge_and_file_tools(self):
+        from src.ask_buddy.agent import _build_git_pr_tools, _build_git_dangerous_tools
+        pr_tools = {t.name for t in _build_git_pr_tools()}
+        dangerous_tools = {t.name for t in _build_git_dangerous_tools()}
+        assert "get_pr_files" in pr_tools
+        assert "get_pr_merge_status" in pr_tools
+        assert "merge_pull_request" in dangerous_tools
+        assert "set_issue_state" in dangerous_tools

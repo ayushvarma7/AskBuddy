@@ -75,7 +75,10 @@ def poll_once(repo: str, post_fn: Callable[[str, str], None]) -> None:
     max_pr = max([p["number"] for p in prs], default=0)
 
     mark = get_git_watermark(repo)
-    first_sight = (mark["last_issue_number"] == 0 and mark["last_pr_number"] == 0)
+    # Bug fix: use a sentinel value in the DB (-1) to mean "never seeded",
+    # rather than 0/0 — a real repo can have 0 PRs legitimately, which the
+    # old check incorrectly treated as "first sight" on every single poll.
+    first_sight = (mark["last_issue_number"] == -1)
 
     if first_sight:
         # Seed silently so we don't dump the whole backlog.
@@ -86,6 +89,10 @@ def poll_once(repo: str, post_fn: Callable[[str, str], None]) -> None:
 
     new_issues = [i for i in issues if i["number"] > mark["last_issue_number"]]
     new_prs = [p for p in prs if p["number"] > mark["last_pr_number"]]
+
+    log.info("[git_watch] polled %s — watermark: issue=%s pr=%s | found: %d new issues, %d new PRs",
+             repo, mark["last_issue_number"], mark["last_pr_number"],
+             len(new_issues), len(new_prs))
 
     if new_issues or new_prs:
         try:
@@ -117,6 +124,8 @@ def start_git_watch(slack_post_fn: Callable[[str, str], None]) -> BackgroundSche
         log.info("[git_watch] GIT_WATCH_CHANNEL unset — triage watcher disabled.")
         return None
 
+    from datetime import datetime
+
     _scheduler = BackgroundScheduler()
     _scheduler.add_job(
         _poll_all,
@@ -124,7 +133,7 @@ def start_git_watch(slack_post_fn: Callable[[str, str], None]) -> BackgroundSche
         args=[slack_post_fn],
         id="git-watch-poll",
         replace_existing=True,
-        next_run_time=None,   # first run happens after one interval; see note
+        next_run_time=datetime.now(),  # fire immediately on startup, not after one interval
     )
     _scheduler.start()
     log.info("[git_watch] started: repos=%s channel=%s every %d min",
