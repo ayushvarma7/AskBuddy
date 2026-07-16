@@ -317,6 +317,43 @@ each repo every `GIT_WATCH_INTERVAL_MINUTES` (default: 5) and posts a
 short summary of **new** issues/PRs to the configured Slack channel.
 On the first poll, watermarks are seeded silently (no backlog dump).
 
+### Daily digest
+
+Unlike the triage watcher (which only reports *new* items), the daily digest
+posts the repo's **full current state** on a schedule:
+
+```
+📊 Daily repo digest — `acme/backend`
+
+Issues
+  • Open: 8   |   Closed: 23
+  • Top labels: `bug` ×3   `enhancement` ×2
+
+Pull Requests
+  • Open: 2   |   Closed/Merged: 14
+  • Drafts (1): #31
+  • Waiting for reviewer (1): #30 _Fix cache TTL config_
+```
+
+**Trigger on demand** (any channel, any time):
+```
+/askbuddy git digest
+/askbuddy git digest acme/backend
+```
+
+**Schedule** (add to `.env`):
+```dotenv
+# Post at 9 AM every day (default if nothing set)
+GIT_DIGEST_TIMES=9:00
+
+# Post twice a day
+GIT_DIGEST_TIMES=9:00,17:00
+
+# Full cron control
+GIT_DIGEST_CRON=0 9 * * 1-5
+GIT_DIGEST_TIMEZONE=America/Los_Angeles
+```
+
 ### New environment variables
 
 ```dotenv
