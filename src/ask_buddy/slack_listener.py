@@ -153,6 +153,13 @@ try:
 except Exception as _e:
     log.warning("Could not start git watch: %s", _e)
 
+# Daily GitHub repo digest (scheduled summary of open/closed issues + PRs)
+try:
+    from .git_digest import start_git_digest
+    start_git_digest(_plain_post)
+except Exception as _e:
+    log.warning("Could not start git digest: %s", _e)
+
 
 # ---------------------------------------------------------------------------
 # Core: run agent in a background thread to avoid blocking Bolt's event loop
@@ -323,6 +330,53 @@ def handle_slash_command(ack, command, respond):
     if not user_text:
         respond("Ask me something, e.g. `/askbuddy how many PTO days do I get?`")
         return
+
+    # ---------------------------------------------------------------------------
+    # Built-in subcommands — handled directly, no agent invocation needed
+    # ---------------------------------------------------------------------------
+
+    # /askbuddy git digest [owner/repo]
+    # Posts an on-demand repo digest to the current channel immediately.
+    lower = user_text.lower()
+    if lower == "git digest" or lower.startswith("git digest "):
+        from .git_digest import post_digest, post_all_digests
+        from .git_watch import _watched_repos
+
+        # optional repo argument: /askbuddy git digest owner/repo
+        parts = user_text.split(None, 2)
+        specific_repo = parts[2].strip() if len(parts) == 3 else None
+
+        def _run_digest():
+            try:
+                if specific_repo:
+                    post_digest(specific_repo, lambda ch, txt: app.client.chat_postMessage(
+                        channel=channel, text=txt))
+                else:
+                    repos = _watched_repos()
+                    if not repos:
+                        app.client.chat_postMessage(
+                            channel=channel,
+                            text="⚠️ No repos configured — set `GIT_WATCH_REPOS` in `.env`.",
+                        )
+                        return
+                    for repo in repos:
+                        post_digest(repo, lambda ch, txt: app.client.chat_postMessage(
+                            channel=channel, text=txt))
+            except Exception:
+                log.exception("[git_digest] on-demand digest failed")
+                app.client.chat_postMessage(
+                    channel=channel,
+                    text="⚠️ Could not fetch the digest — check bot logs.",
+                )
+
+        respond("⏳ Fetching repo digest…")
+        t = threading.Thread(target=_run_digest, daemon=True)
+        t.start()
+        return
+
+    # ---------------------------------------------------------------------------
+    # All other text → route to the agent as normal
+    # ---------------------------------------------------------------------------
 
     respond("⏳ Looking that up…")
 

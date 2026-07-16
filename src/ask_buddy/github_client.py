@@ -188,6 +188,156 @@ def get_pr_checks(repo: str, number: int) -> dict:
     return out
 
 
+def get_pr_files(repo: str, number: int, limit: int = MAX_LIST) -> list[dict]:
+    """List files changed by a PR: filename, status (added/modified/removed/
+    renamed), additions, deletions, changes. Raw patch text is excluded to
+    keep tool output small. Read-only."""
+    owner, name = _split_repo(repo)
+    data = _request(f"/repos/{owner}/{name}/pulls/{number}/files",
+                    {"per_page": min(limit, 100)})
+    return [
+        {
+            "filename": f.get("filename"),
+            "status": f.get("status"),
+            "additions": f.get("additions", 0),
+            "deletions": f.get("deletions", 0),
+            "changes": f.get("changes", 0),
+        }
+        for f in data[:limit]
+    ]
+
+
+def get_pr_merge_status(repo: str, number: int) -> dict:
+    """
+    Composite merge-readiness verdict combining PR state, reviews, and CI
+    checks into one answer. Read-only — makes NO merge call.
+
+    Returns:
+        {
+          "mergeable": bool | None,
+          "draft": bool,
+          "approved_count": int,
+          "changes_requested_count": int,
+          "checks_passed": bool,
+          "checks_summary": {"total", "success", "failure", "pending"},
+          "blocking_reasons": list[str],   # empty = nothing blocking
+        }
+    """
+    pr = get_pull_request(repo, number)
+    reviews = get_pr_reviews(repo, number)
+    checks = get_pr_checks(repo, number)
+
+    # Latest review per reviewer wins.
+    latest_by_reviewer: dict[str, str] = {}
+    for r in reviews:
+        latest_by_reviewer[r["reviewer"]] = r["state"]
+    approved_count = sum(1 for s in latest_by_reviewer.values() if s == "APPROVED")
+    changes_requested_count = sum(
+        1 for s in latest_by_reviewer.values() if s == "CHANGES_REQUESTED"
+    )
+
+    checks_passed = checks["total"] == 0 or (
+        checks["failure"] == 0 and checks["pending"] == 0
+    )
+
+    blocking: list[str] = []
+    if pr.get("draft"):
+        blocking.append("PR is a draft")
+    if changes_requested_count > 0:
+        blocking.append(f"{changes_requested_count} reviewer(s) requested changes")
+    if checks["failure"] > 0:
+        blocking.append(f"{checks['failure']} CI check(s) failing")
+    if checks["pending"] > 0:
+        blocking.append(f"{checks['pending']} CI check(s) still pending")
+    if pr.get("mergeable_state") in ("dirty", "blocked"):
+        blocking.append(f"GitHub reports mergeable_state='{pr['mergeable_state']}'")
+
+    return {
+        "mergeable": pr.get("mergeable_state") == "clean" if pr.get("mergeable_state") else None,
+        "draft": pr.get("draft", False),
+        "approved_count": approved_count,
+        "changes_requested_count": changes_requested_count,
+        "checks_passed": checks_passed,
+        "checks_summary": {k: checks[k] for k in ("total", "success", "failure", "pending")},
+        "blocking_reasons": blocking,
+    }
+
+
+def _request_write(method: str, path: str, json_body: dict | None = None) -> Any:
+    """POST/PATCH/PUT variant of _request — same error handling."""
+    url = f"{_base_url()}{path}"
+    try:
+        resp = httpx.request(method, url, headers=_headers(), json=json_body,
+                             timeout=DEFAULT_TIMEOUT)
+    except httpx.HTTPError as e:
+        raise GitHubError(f"Network error calling GitHub: {e}") from e
+    if resp.status_code in (401, 403):
+        raise GitHubError(
+            "GitHub write permission error — the PAT needs Read-and-write "
+            "on Issues/Pull requests for this action."
+        )
+    if resp.status_code == 404:
+        raise GitHubError(f"Not found: {path}")
+    if resp.status_code >= 400:
+        raise GitHubError(f"GitHub error {resp.status_code}: {resp.text[:200]}")
+    return resp.json() if resp.text else {}
+
+
+def add_issue_comment(repo: str, number: int, body: str) -> dict:
+    """Post a comment on an issue or PR. Returns {'url': ..., 'created_at': ...}."""
+    owner, name = _split_repo(repo)
+    data = _request_write("POST", f"/repos/{owner}/{name}/issues/{number}/comments",
+                          {"body": body})
+    return {"url": data.get("html_url"), "created_at": data.get("created_at")}
+
+
+def add_labels(repo: str, number: int, labels: list[str]) -> list[str]:
+    """Add one or more labels to an issue or PR. Returns the full label set after the call."""
+    owner, name = _split_repo(repo)
+    data = _request_write("POST", f"/repos/{owner}/{name}/issues/{number}/labels",
+                          {"labels": labels})
+    return [l["name"] for l in data]
+
+
+def set_issue_state(repo: str, number: int, state: str) -> dict:
+    """state: 'open' or 'closed'. Works for issues and PRs (does NOT merge a PR)."""
+    if state not in ("open", "closed"):
+        raise GitHubError("state must be 'open' or 'closed'.")
+    owner, name = _split_repo(repo)
+    data = _request_write("PATCH", f"/repos/{owner}/{name}/issues/{number}",
+                          {"state": state})
+    return {"number": data.get("number"), "state": data.get("state")}
+
+
+def assign_users(repo: str, number: int, assignees: list[str]) -> list[str]:
+    """Add assignees to an issue or PR. Returns the full assignee list after the call."""
+    owner, name = _split_repo(repo)
+    data = _request_write("POST", f"/repos/{owner}/{name}/issues/{number}/assignees",
+                          {"assignees": assignees})
+    return [_trim_user(a) for a in data.get("assignees", [])]
+
+
+def request_pr_reviewers(repo: str, number: int, reviewers: list[str]) -> list[str]:
+    """Request one or more reviewers on a PR. Returns the requested-reviewer list."""
+    owner, name = _split_repo(repo)
+    data = _request_write(
+        "POST", f"/repos/{owner}/{name}/pulls/{number}/requested_reviewers",
+        {"reviewers": reviewers},
+    )
+    return [_trim_user(r) for r in data.get("requested_reviewers", [])]
+
+
+def merge_pull_request(repo: str, number: int, merge_method: str = "merge") -> dict:
+    """merge_method: 'merge' | 'squash' | 'rebase'. HIGH BLAST RADIUS — gated
+    behind a ToolApproval policy at the agent layer. Returns {'merged': bool, 'message': str}."""
+    if merge_method not in ("merge", "squash", "rebase"):
+        raise GitHubError("merge_method must be 'merge', 'squash', or 'rebase'.")
+    owner, name = _split_repo(repo)
+    data = _request_write("PUT", f"/repos/{owner}/{name}/pulls/{number}/merge",
+                          {"merge_method": merge_method})
+    return {"merged": data.get("merged", False), "message": data.get("message", "")}
+
+
 def search_issues(query: str, limit: int = MAX_LIST) -> list[dict]:
     """Cross-repo search using GitHub's search syntax, e.g.
     'repo:acme/backend is:open label:bug'. Returns trimmed issue/PR dicts."""

@@ -138,51 +138,60 @@ instead of guessing.
 """
 
 GIT_ISSUE_SYSTEM_PROMPT = """\
-You are the Git Issue Agent within Ask Buddy. You answer READ-ONLY questions \
-about GitHub issues: listing open/closed issues, summarizing a specific issue, \
-who is assigned, what labels it has, and searching issues.
+You are the Git Issue Agent within Ask Buddy. You handle GitHub issues.
 
-You have these tools: list_issues, get_issue, search_issues. You CANNOT create, \
-edit, comment on, or close issues — you are read-only. If a user asks you to \
-change anything, tell them plainly that Ask Buddy's git access is read-only.
+You have READ tools (list_issues, get_issue, search_issues) and WRITE tools \
+(add_issue_comment, add_labels, assign_users, set_issue_state).
 
 == PROCESS ==
-1. Identify the repository as 'owner/name'. If the user did not give a repo and \
-one cannot be inferred, ask them which repo (via post_slack_message).
+1. Identify the repository as 'owner/name'. If missing, ask via post_slack_message.
 2. Call the right tool. Read the result.
-3. Reply in plain English. For lists, show issue number, title, and state, one \
-per line, most recent first. For a single issue, summarize title, state, author, \
-labels, assignees, and a 1-2 sentence gist of the body. Always include the \
-issue URL(s).
+3. Reply in plain English. For lists: issue number, title, state, one per line. \
+For a single issue: title, state, author, labels, assignees, 1-2 sentence body \
+summary, URL.
+
+== WRITE ACTION RULES ==
+- Only take a write action when the request is unambiguous about repo, issue \
+number, and what to change. If anything is ambiguous, ask first.
+- set_issue_state (close/reopen) requires the user to confirm — the confirmation \
+happens automatically via Slack; just call the tool.
+- Never claim an action succeeded unless the tool result confirms it. Relay \
+errors plainly.
 
 == HARD RULES ==
-- Read-only. Never claim to have changed anything.
-- Never fabricate issue numbers, titles, authors, or URLs — only report what the \
-tool returned.
-- If a tool returns an error (e.g. GitHub not configured, repo not found), relay \
-a short, clear message; do not guess.
+- Never fabricate issue numbers, titles, authors, or URLs.
+- On tool error, relay a short clear message; do not guess.
 - Deliver the final answer via post_slack_message.
 """
 
 GIT_PR_SYSTEM_PROMPT = """\
-You are the Git PR Agent within Ask Buddy. You answer READ-ONLY questions about \
-GitHub pull requests: listing open/closed PRs, summarizing a specific PR, its \
-review status, requested reviewers, and CI check results.
+You are the Git PR Agent within Ask Buddy. You handle GitHub pull requests.
 
-You have these tools: list_pull_requests, get_pull_request, get_pr_reviews, \
-get_pr_checks. You CANNOT open, approve, comment on, or merge PRs — read-only.
+You have READ tools (list_pull_requests, get_pull_request, get_pr_reviews, \
+get_pr_checks, get_pr_files, get_pr_merge_status) and WRITE tools \
+(add_issue_comment, add_labels, assign_users, request_pr_reviewers, \
+set_issue_state, merge_pull_request).
 
 == PROCESS ==
 1. Identify the repository as 'owner/name'; ask if missing.
-2. Call the right tool(s). To answer "is PR #N ready to merge?" combine \
-get_pull_request (draft/mergeable_state), get_pr_reviews (approvals), and \
-get_pr_checks (CI pass/fail).
-3. Reply in plain English. For lists: PR number, title, author, draft flag. For \
-a single PR: title, author, base<-head, reviewers + their verdicts, CI summary \
-(X passed / Y failed / Z pending), and the PR URL.
+2. For "is PR #N ready to merge?" call get_pr_merge_status — it already \
+combines review verdicts, CI checks, and draft status into one result with a \
+blocking_reasons list. Only fall back to get_pull_request / get_pr_reviews / \
+get_pr_checks individually if you need more detail.
+3. For "what does PR #N change?" call get_pr_files and summarize by file count \
+and the largest diffs.
+4. Reply in plain English. For lists: PR number, title, author, draft flag. For \
+a single PR: title, author, base←head, reviewers + verdicts, CI summary, URL.
+
+== WRITE ACTION RULES ==
+- Only take a write action when the request is unambiguous about repo, PR number, \
+and what to change. If anything is ambiguous, ask first.
+- merge_pull_request and set_issue_state require the user to confirm — the \
+confirmation happens automatically via Slack; just call the tool.
+- Never claim an action succeeded unless the tool result confirms it. Relay \
+errors plainly.
 
 == HARD RULES ==
-- Read-only. Never claim to have merged/approved/commented.
 - Never fabricate PR numbers, reviewers, verdicts, or check results.
 - On tool error, relay a short clear message; do not guess.
 - Deliver the final answer via post_slack_message.
@@ -475,27 +484,140 @@ def _build_git_pr_tools():
         except gh.GitHubError as e:
             return {"error": str(e)}
 
-    return list_pull_requests, get_pull_request, get_pr_reviews, get_pr_checks
+    @tool
+    def get_pr_files(repo: str, number: int) -> list[dict]:
+        """List files changed in a PR: filename, status, additions, deletions. Read-only."""
+        try:
+            return gh.get_pr_files(repo, number)
+        except gh.GitHubError as e:
+            return [{"error": str(e)}]
+
+    @tool
+    def get_pr_merge_status(repo: str, number: int) -> dict:
+        """One-call merge-readiness verdict: mergeable, draft, approvals,
+        changes-requested count, CI pass/fail, and blocking_reasons list
+        (empty = nothing blocking). Read-only — reports status, does not merge."""
+        try:
+            return gh.get_pr_merge_status(repo, number)
+        except gh.GitHubError as e:
+            return {"error": str(e)}
+
+    return (list_pull_requests, get_pull_request, get_pr_reviews, get_pr_checks,
+            get_pr_files, get_pr_merge_status)
+
+
+def _build_git_write_tools():
+    """Low-risk write tools: comment, label, assign, request review.
+    Not approval-gated — easily reversible, low blast radius."""
+    from langchain_core.tools import tool
+    from . import github_client as gh
+
+    @tool
+    def add_issue_comment(repo: str, number: int, body: str) -> dict:
+        """Post a comment on an issue or PR in 'owner/repo'."""
+        try:
+            return gh.add_issue_comment(repo, number, body)
+        except gh.GitHubError as e:
+            return {"error": str(e)}
+
+    @tool
+    def add_labels(repo: str, number: int, labels: list[str]) -> list[str]:
+        """Add labels to an issue or PR. Labels must already exist on the repo."""
+        try:
+            return gh.add_labels(repo, number, labels)
+        except gh.GitHubError as e:
+            return [f"error: {e}"]
+
+    @tool
+    def assign_users(repo: str, number: int, assignees: list[str]) -> list[str]:
+        """Assign GitHub users (by login) to an issue or PR."""
+        try:
+            return gh.assign_users(repo, number, assignees)
+        except gh.GitHubError as e:
+            return [f"error: {e}"]
+
+    @tool
+    def request_pr_reviewers(repo: str, number: int, reviewers: list[str]) -> list[str]:
+        """Request GitHub users (by login) as reviewers on a PR."""
+        try:
+            return gh.request_pr_reviewers(repo, number, reviewers)
+        except gh.GitHubError as e:
+            return [f"error: {e}"]
+
+    return add_issue_comment, add_labels, assign_users, request_pr_reviewers
+
+
+def _build_git_dangerous_tools():
+    """High-risk write tools: close/reopen/merge.
+    MUST be approval-gated via agent.policies.add_tool_approval."""
+    from langchain_core.tools import tool
+    from . import github_client as gh
+
+    @tool
+    def set_issue_state(repo: str, number: int, state: str) -> dict:
+        """Close or reopen an issue or PR. state: 'open' or 'closed'."""
+        try:
+            return gh.set_issue_state(repo, number, state)
+        except gh.GitHubError as e:
+            return {"error": str(e)}
+
+    @tool
+    def merge_pull_request(repo: str, number: int, merge_method: str = "merge") -> dict:
+        """Merge a PR. merge_method: 'merge', 'squash', or 'rebase'."""
+        try:
+            return gh.merge_pull_request(repo, number, merge_method)
+        except gh.GitHubError as e:
+            return {"error": str(e)}
+
+    return set_issue_state, merge_pull_request
 
 
 def build_git_issue_agent(slack_post_fn: Callable[[str, str], None]) -> CugaAgent:
+    import asyncio
     post_tool = _build_post_tool(slack_post_fn)
     list_issues, get_issue, search_issues = _build_git_issue_tools()
-    return CugaAgent(
-        tools=[list_issues, get_issue, search_issues, post_tool],
+    add_comment, add_labels_tool, assign_tool, _ = _build_git_write_tools()
+    set_state_tool, _ = _build_git_dangerous_tools()
+    agent = CugaAgent(
+        tools=[list_issues, get_issue, search_issues,
+               add_comment, add_labels_tool, assign_tool, set_state_tool,
+               post_tool],
         enable_knowledge=False,
         special_instructions=GIT_ISSUE_SYSTEM_PROMPT,
     )
+    asyncio.run(agent.policies.add_tool_approval(
+        name="Approve issue state change",
+        required_tools=["set_issue_state"],
+        approval_message="This will close or reopen the issue on GitHub. Confirm?",
+    ))
+    return agent
 
 
 def build_git_pr_agent(slack_post_fn: Callable[[str, str], None]) -> CugaAgent:
+    import asyncio
     post_tool = _build_post_tool(slack_post_fn)
-    list_prs, get_pr, get_reviews, get_checks = _build_git_pr_tools()
-    return CugaAgent(
-        tools=[list_prs, get_pr, get_reviews, get_checks, post_tool],
+    (list_prs, get_pr, get_reviews, get_checks,
+     get_files, get_merge_status) = _build_git_pr_tools()
+    add_comment, add_labels_tool, assign_tool, request_reviewers_tool = _build_git_write_tools()
+    set_state_tool, merge_tool = _build_git_dangerous_tools()
+    agent = CugaAgent(
+        tools=[list_prs, get_pr, get_reviews, get_checks, get_files, get_merge_status,
+               add_comment, add_labels_tool, assign_tool, request_reviewers_tool,
+               set_state_tool, merge_tool, post_tool],
         enable_knowledge=False,
         special_instructions=GIT_PR_SYSTEM_PROMPT,
     )
+    asyncio.run(agent.policies.add_tool_approval(
+        name="Approve PR merge",
+        required_tools=["merge_pull_request"],
+        approval_message="This will merge the pull request into its base branch. Confirm?",
+    ))
+    asyncio.run(agent.policies.add_tool_approval(
+        name="Approve PR state change",
+        required_tools=["set_issue_state"],
+        approval_message="This will close or reopen the pull request on GitHub. Confirm?",
+    ))
+    return agent
 
 
 def build_scheduler_agent(
