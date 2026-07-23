@@ -69,43 +69,116 @@ def _digest_times() -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Review-latency signal (point 3 — review-quality metric)
+# ---------------------------------------------------------------------------
+
+def _parse_iso(ts: str | None):
+    """Parse a GitHub ISO8601 timestamp ('…Z') into an aware datetime, or None."""
+    if not ts:
+        return None
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _avg_first_review_latency_hours(repo: str, open_prs: list[dict]) -> float | None:
+    """
+    Average time (hours) from a PR opening to its first review, across the
+    currently-open non-draft PRs that have received at least one review.
+    Returns None when no open PR has been reviewed yet. Costs one reviews
+    call per open non-draft PR — fine for the small watched-repo set.
+    """
+    latencies: list[float] = []
+    for pr in open_prs:
+        if pr.get("draft"):
+            continue
+        opened = _parse_iso(pr.get("created_at"))
+        if opened is None:
+            continue
+        try:
+            reviews = gh.get_pr_reviews(repo, pr["number"])
+        except gh.GitHubError:
+            continue
+        review_times = [t for t in (_parse_iso(r.get("submitted_at")) for r in reviews) if t]
+        if not review_times:
+            continue
+        first = min(review_times)
+        hours = (first - opened).total_seconds() / 3600.0
+        if hours >= 0:
+            latencies.append(hours)
+    if not latencies:
+        return None
+    return round(sum(latencies) / len(latencies), 1)
+
+
+# ---------------------------------------------------------------------------
 # Digest formatter
 # ---------------------------------------------------------------------------
 
-def build_digest(repo: str) -> str:
+def compute_digest_stats(repo: str, include_review_latency: bool = False) -> dict:
     """
-    Fetch current repo state from GitHub and return a formatted Slack message.
-    Raises GitHubError on any API failure.
+    Fetch current repo state and return the raw counts used by the digest.
+    Split out from build_digest so both the message and the persisted trend
+    snapshot come from one computation. Raises GitHubError on any API failure.
     """
     open_issues   = gh.list_issues(repo, state="open",   limit=100)
     closed_issues = gh.list_issues(repo, state="closed", limit=100)
     open_prs      = gh.list_pull_requests(repo, state="open",   limit=100)
     closed_prs    = gh.list_pull_requests(repo, state="closed", limit=100)
 
-    # --- issue stats ---
-    total_open_issues   = len(open_issues)
-    total_closed_issues = len(closed_issues)
-
-    # label breakdown (top 5 by frequency)
     label_counts: dict[str, int] = {}
     for issue in open_issues:
         for label in issue.get("labels", []):
             label_counts[label] = label_counts.get(label, 0) + 1
     top_labels = sorted(label_counts.items(), key=lambda x: x[1], reverse=True)[:5]
 
-    # --- PR stats ---
-    total_open_prs   = len(open_prs)
-    total_closed_prs = len(closed_prs)   # closed includes merged on this endpoint
-    draft_prs        = [p for p in open_prs if p.get("draft")]
-    review_needed    = [p for p in open_prs
-                        if not p.get("draft") and not p.get("requested_reviewers")]
+    draft_prs     = [p for p in open_prs if p.get("draft")]
+    review_needed = [p for p in open_prs
+                     if not p.get("draft") and not p.get("requested_reviewers")]
 
-    # --- format ---
+    latency = (_avg_first_review_latency_hours(repo, open_prs)
+               if include_review_latency else None)
+
+    return {
+        "open_issues": len(open_issues),
+        "closed_issues": len(closed_issues),
+        "open_prs": len(open_prs),
+        "closed_prs": len(closed_prs),   # closed includes merged on this endpoint
+        "draft_prs": len(draft_prs),
+        "review_needed": len(review_needed),
+        "avg_review_latency_hours": latency,
+        # kept for rendering only (not persisted)
+        "_top_labels": top_labels,
+        "_draft_pr_list": draft_prs,
+        "_review_needed_list": review_needed,
+        "_has_open_prs": bool(open_prs),
+    }
+
+
+def _fmt_delta(current: float | int | None, previous: float | int | None,
+               suffix: str = "") -> str:
+    """Render a signed delta with a directional arrow, e.g. '▲2' or '▼1.2h'."""
+    if current is None or previous is None:
+        return ""
+    diff = round(current - previous, 1)
+    if diff == 0:
+        return "±0"
+    arrow = "▲" if diff > 0 else "▼"
+    return f"{arrow}{abs(diff)}{suffix}"
+
+
+def _render_digest(repo: str, stats: dict, previous: dict | None) -> str:
+    top_labels = stats["_top_labels"]
+    draft_prs = stats["_draft_pr_list"]
+    review_needed = stats["_review_needed_list"]
+
     lines = [
         f":bar_chart: *Daily repo digest — `{repo}`*",
         "",
         "*Issues*",
-        f"  • Open: *{total_open_issues}*   |   Closed: *{total_closed_issues}*",
+        f"  • Open: *{stats['open_issues']}*   |   Closed: *{stats['closed_issues']}*",
     ]
 
     if top_labels:
@@ -117,7 +190,7 @@ def build_digest(repo: str) -> str:
     lines += [
         "",
         "*Pull Requests*",
-        f"  • Open: *{total_open_prs}*   |   Closed/Merged: *{total_closed_prs}*",
+        f"  • Open: *{stats['open_prs']}*   |   Closed/Merged: *{stats['closed_prs']}*",
     ]
 
     if draft_prs:
@@ -131,30 +204,88 @@ def build_digest(repo: str) -> str:
                          for p in review_needed
                      ))
 
-    if not open_prs:
+    if not stats["_has_open_prs"]:
         lines.append("  • No open PRs :white_check_mark:")
 
+    if stats.get("avg_review_latency_hours") is not None:
+        lines.append(f"  • Avg time-to-first-review: *{stats['avg_review_latency_hours']}h*")
+
+    # --- trend deltas vs the last stored snapshot ---
+    if previous:
+        captured = previous.get("captured_at")
+        when = captured.strftime("%b %-d") if hasattr(captured, "strftime") else "last digest"
+        parts = []
+        oi = _fmt_delta(stats["open_issues"], previous.get("open_issues"))
+        op = _fmt_delta(stats["open_prs"], previous.get("open_prs"))
+        rl = _fmt_delta(stats.get("avg_review_latency_hours"),
+                        previous.get("avg_review_latency_hours"), suffix="h")
+        if oi:
+            parts.append(f"open issues {oi}")
+        if op:
+            parts.append(f"open PRs {op}")
+        if rl:
+            parts.append(f"review latency {rl}")
+        if parts:
+            lines += ["", f":chart_with_upwards_trend: _Since {when}: " + ", ".join(parts) + "_"]
+
     return "\n".join(lines)
+
+
+def build_digest(repo: str, previous: dict | None = None,
+                 include_review_latency: bool = False) -> str:
+    """
+    Fetch current repo state from GitHub and return a formatted Slack message.
+    Pass `previous` (a prior snapshot dict) to append trend deltas, and
+    `include_review_latency=True` to add the avg time-to-first-review line.
+    Raises GitHubError on any API failure.
+    """
+    stats = compute_digest_stats(repo, include_review_latency=include_review_latency)
+    return _render_digest(repo, stats, previous)
 
 
 # ---------------------------------------------------------------------------
 # Scheduled + on-demand posting
 # ---------------------------------------------------------------------------
 
-def post_digest(repo: str, post_fn: Callable[[str, str], None]) -> None:
-    """Fetch and post the digest for one repo. Logs on error, never raises."""
+def post_digest(repo: str, post_fn: Callable[[str, str], None],
+                with_trend: bool = True) -> None:
+    """Fetch and post the digest for one repo. Logs on error, never raises.
+
+    When `with_trend` is set (the scheduled path), the digest includes review
+    latency + deltas vs the last stored snapshot, and persists a fresh snapshot
+    afterwards. DB access is best-effort — a missing/unavailable DB downgrades
+    gracefully to a plain digest rather than failing the post."""
     channel = _channel()
     if not channel:
         log.warning("[git_digest] GIT_WATCH_CHANNEL not set, skipping digest for %s", repo)
         return
+
+    previous = None
+    if with_trend:
+        try:
+            from .db import get_last_digest_snapshot
+            previous = get_last_digest_snapshot(repo)
+        except Exception as e:
+            log.warning("[git_digest] could not load previous snapshot for %s: %s", repo, e)
+
     try:
-        message = build_digest(repo)
+        stats = compute_digest_stats(repo, include_review_latency=with_trend)
+        message = _render_digest(repo, stats, previous)
         post_fn(channel, message)
         log.info("[git_digest] posted digest for %s", repo)
     except gh.GitHubError as e:
         log.warning("[git_digest] GitHub error for %s: %s", repo, e)
+        return
     except Exception:
         log.exception("[git_digest] unexpected error posting digest for %s", repo)
+        return
+
+    if with_trend:
+        try:
+            from .db import insert_digest_snapshot
+            insert_digest_snapshot(repo, stats)
+        except Exception as e:
+            log.warning("[git_digest] could not persist snapshot for %s: %s", repo, e)
 
 
 def post_all_digests(post_fn: Callable[[str, str], None]) -> None:

@@ -1185,3 +1185,294 @@ class TestGitWatchRateLimitSkip:
             gw.poll_once("a/b", lambda ch, txt: None)
 
         assert any("rate limited" in r.message for r in caplog.records)
+
+
+# ===========================================================================
+# Point 3 — GitHub proactive intelligence (digest trends, latency, stale PRs,
+# merge cards). All offline: gh + db are monkeypatched.
+# ===========================================================================
+
+class TestDigestTrendsAndLatency:
+    def _pr(self, n, created_at, draft=False):
+        return {"number": n, "title": f"pr {n}", "state": "open", "draft": draft,
+                "author": "bob", "labels": [], "requested_reviewers": [],
+                "base": "main", "head": f"f{n}", "head_sha": "abc",
+                "mergeable_state": "clean", "created_at": created_at,
+                "updated_at": created_at, "url": f"http://y/{n}"}
+
+    def test_fmt_delta_arrows(self):
+        import src.ask_buddy.git_digest as gd
+        assert gd._fmt_delta(5, 3) == "▲2"
+        assert gd._fmt_delta(3, 5) == "▼2"
+        assert gd._fmt_delta(4, 4) == "±0"
+        assert gd._fmt_delta(None, 4) == ""
+        assert gd._fmt_delta(1.5, 3.0, suffix="h") == "▼1.5h"
+
+    def test_compute_digest_stats_keys(self, monkeypatch):
+        import src.ask_buddy.git_digest as gd
+        import src.ask_buddy.github_client as gh
+        monkeypatch.setattr(gh, "list_issues", lambda repo, state="open", limit=100: [])
+        monkeypatch.setattr(gh, "list_pull_requests",
+                            lambda repo, state="open", limit=100: [])
+        stats = gd.compute_digest_stats("a/b", include_review_latency=False)
+        for key in ("open_issues", "closed_issues", "open_prs", "closed_prs",
+                    "draft_prs", "review_needed", "avg_review_latency_hours"):
+            assert key in stats
+        assert stats["avg_review_latency_hours"] is None
+
+    def test_avg_first_review_latency(self, monkeypatch):
+        import src.ask_buddy.git_digest as gd
+        import src.ask_buddy.github_client as gh
+        prs = [self._pr(1, "2026-01-01T00:00:00Z")]
+        # first review 2 hours after opening
+        monkeypatch.setattr(gh, "get_pr_reviews", lambda repo, n: [
+            {"reviewer": "carol", "state": "APPROVED", "submitted_at": "2026-01-01T02:00:00Z"},
+        ])
+        latency = gd._avg_first_review_latency_hours("a/b", prs)
+        assert latency == 2.0
+
+    def test_build_digest_includes_trend_line(self, monkeypatch):
+        import src.ask_buddy.git_digest as gd
+        import src.ask_buddy.github_client as gh
+        monkeypatch.setattr(gh, "list_issues",
+                            lambda repo, state="open", limit=100:
+                            [{"number": i, "title": "x", "state": "open",
+                              "author": "a", "labels": [], "assignees": [],
+                              "comments": 0, "created_at": None,
+                              "updated_at": None, "url": "u"} for i in range(5)]
+                            if state == "open" else [])
+        monkeypatch.setattr(gh, "list_pull_requests",
+                            lambda repo, state="open", limit=100: [])
+        previous = {"open_issues": 3, "open_prs": 0,
+                    "avg_review_latency_hours": None, "captured_at": None}
+        text = gd.build_digest("a/b", previous=previous)
+        assert "Since" in text
+        assert "open issues ▲2" in text
+
+
+class TestMergeCard:
+    def _pr(self, ready=True):
+        return {"number": 7, "title": "Add TTL", "author": "alice",
+                "base": "main", "head": "feat", "url": "http://x/7", "_repo": "a/b"}
+
+    def test_merge_card_ready_has_buttons(self):
+        from src.ask_buddy.git_ui import build_merge_card
+        status = {"draft": False, "approved_count": 1, "changes_requested_count": 0,
+                  "checks_passed": True, "checks_summary": {"success": 2, "failure": 0, "pending": 0},
+                  "blocking_reasons": []}
+        blocks = build_merge_card(self._pr(), status)
+        actions = [b for b in blocks if b["type"] == "actions"]
+        assert actions, "ready PR should show merge buttons"
+        ids = {el["action_id"] for el in actions[0]["elements"]}
+        assert ids == {"pr_merge_request"}
+
+    def test_merge_card_blocked_no_buttons(self):
+        from src.ask_buddy.git_ui import build_merge_card
+        status = {"draft": True, "approved_count": 0, "changes_requested_count": 1,
+                  "checks_passed": False, "checks_summary": {"success": 0, "failure": 1, "pending": 0},
+                  "blocking_reasons": ["PR is a draft", "1 CI check(s) failing"]}
+        blocks = build_merge_card(self._pr(), status)
+        assert not [b for b in blocks if b["type"] == "actions"]
+        import json
+        text = json.dumps(blocks)
+        assert "Blocked" in text and "draft" in text
+
+    def test_confirm_card_carries_payload(self):
+        import json as _j
+        from src.ask_buddy.git_ui import build_merge_confirm_card
+        blocks = build_merge_confirm_card(7, "a/b", "squash")
+        actions = [b for b in blocks if b["type"] == "actions"][0]
+        for el in actions["elements"]:
+            payload = _j.loads(el["value"])
+            assert payload["repo"] == "a/b" and payload["number"] == 7
+            assert payload["method"] == "squash"
+
+    def test_fetch_merge_card(self, monkeypatch):
+        import src.ask_buddy.github_client as gh
+        from src.ask_buddy import git_ui
+        monkeypatch.setattr(gh, "get_pull_request", lambda repo, n: {
+            "number": n, "title": "T", "author": "a", "base": "main",
+            "head": "f", "url": "http://x"})
+        monkeypatch.setattr(gh, "get_pr_merge_status", lambda repo, n: {
+            "draft": False, "approved_count": 1, "changes_requested_count": 0,
+            "checks_passed": True, "checks_summary": {"success": 1, "failure": 0, "pending": 0},
+            "blocking_reasons": []})
+        fallback, blocks = git_ui.fetch_merge_card("a/b", 7)
+        assert "ready to merge" in fallback
+        assert any(b["type"] == "actions" for b in blocks)
+
+
+class TestStalePRNudger:
+    def _pr(self, n, created_at, reviewers, draft=False):
+        return {"number": n, "title": f"pr {n}", "draft": draft,
+                "requested_reviewers": reviewers, "created_at": created_at,
+                "url": f"http://y/{n}"}
+
+    def test_age_days(self):
+        import src.ask_buddy.git_stale as gs
+        assert gs._age_days({"created_at": "2020-01-01T00:00:00Z"}) > 1000
+        assert gs._age_days({"created_at": None}) is None
+
+    def test_has_approval(self, monkeypatch):
+        import src.ask_buddy.git_stale as gs
+        import src.ask_buddy.github_client as gh
+        monkeypatch.setattr(gh, "get_pr_reviews", lambda repo, n: [
+            {"reviewer": "x", "state": "COMMENTED"}])
+        assert gs._has_approval("a/b", 1) is False
+        monkeypatch.setattr(gh, "get_pr_reviews", lambda repo, n: [
+            {"reviewer": "x", "state": "APPROVED"}])
+        assert gs._has_approval("a/b", 1) is True
+
+    def test_nudge_targets_split(self, monkeypatch):
+        import src.ask_buddy.git_stale as gs
+        import src.ask_buddy.db as db
+        monkeypatch.setattr(db, "get_slack_user_for_github_login",
+                            lambda login: "U_ALICE" if login == "alice" else None)
+        pr = self._pr(1, "2020-01-01T00:00:00Z", ["alice", "bob"])
+        dm, unlinked = gs._nudge_targets(pr)
+        assert dm == ["U_ALICE"]
+        assert unlinked == ["bob"]
+
+    def test_check_repo_dms_linked_reviewer_and_dedups(self, monkeypatch):
+        import src.ask_buddy.git_stale as gs
+        import src.ask_buddy.github_client as gh
+        import src.ask_buddy.db as db
+
+        monkeypatch.setenv("GIT_STALE_PR_DAYS", "1")
+        monkeypatch.setenv("GIT_WATCH_CHANNEL", "eng")
+        monkeypatch.setattr(gh, "list_pull_requests",
+                            lambda repo, state="open", limit=100:
+                            [self._pr(5, "2020-01-01T00:00:00Z", ["alice"])])
+        monkeypatch.setattr(gh, "get_pr_reviews", lambda repo, n: [])  # no approval
+        monkeypatch.setattr(db, "get_slack_user_for_github_login",
+                            lambda login: "U_ALICE")
+        monkeypatch.setattr(db, "get_last_nudge_epoch", lambda repo, n: None)
+        recorded = []
+        monkeypatch.setattr(db, "record_pr_nudge",
+                            lambda repo, n: recorded.append((repo, n)))
+
+        posts = []
+        n = gs.check_repo("a/b", lambda ch, txt: posts.append((ch, txt)))
+        assert n == 1
+        assert posts[0][0] == "U_ALICE"          # DM'd the linked reviewer
+        assert recorded == [("a/b", 5)]          # nudge recorded
+
+    def test_check_repo_skips_recently_nudged(self, monkeypatch):
+        import time
+        import src.ask_buddy.git_stale as gs
+        import src.ask_buddy.github_client as gh
+        import src.ask_buddy.db as db
+        monkeypatch.setenv("GIT_STALE_PR_DAYS", "1")
+        monkeypatch.setattr(gh, "list_pull_requests",
+                            lambda repo, state="open", limit=100:
+                            [self._pr(5, "2020-01-01T00:00:00Z", ["alice"])])
+        monkeypatch.setattr(db, "get_last_nudge_epoch", lambda repo, n: time.time())
+        posts = []
+        assert gs.check_repo("a/b", lambda ch, txt: posts.append(txt)) == 0
+        assert posts == []
+
+
+# ===========================================================================
+# Point 4 — self-tuning feedback loop (auto few-shots, config recommendation)
+# ===========================================================================
+
+class TestAutoFewShotAndConfig:
+    def test_auto_fewshot_count_scales_and_caps(self, monkeypatch):
+        import src.ask_buddy.db as db
+        from src.ask_buddy.agent import _auto_fewshot_count
+        monkeypatch.setattr(db, "count_positive_examples", lambda: 2)
+        assert _auto_fewshot_count() == 0          # below the 3-example floor
+        monkeypatch.setattr(db, "count_positive_examples", lambda: 12)
+        assert _auto_fewshot_count() == 2          # 12 // 5
+        monkeypatch.setattr(db, "count_positive_examples", lambda: 100)
+        assert _auto_fewshot_count() == 5          # capped
+
+    def test_recommend_config_flags_switch(self, monkeypatch):
+        import src.ask_buddy.db as db
+        from src.ask_buddy import agent as agent_mod
+        monkeypatch.setenv("AGENT_SETTING_CONFIG", "settings.a.toml")
+        monkeypatch.setenv("MODEL_NAME", "model-a")
+        monkeypatch.setattr(db, "get_config_quality", lambda: [
+            {"config": "settings.a.toml:model-a", "rated": 40, "negative": 16,
+             "positive": 24, "negative_rate": 0.40},
+            {"config": "settings.b.toml:model-b", "rated": 40, "negative": 4,
+             "positive": 36, "negative_rate": 0.10},
+        ])
+        rec = agent_mod.recommend_agent_config()
+        assert rec["best"] == "settings.b.toml:model-b"
+        assert rec["should_switch"] is True
+
+    def test_recommend_config_no_switch_when_current_best(self, monkeypatch):
+        import src.ask_buddy.db as db
+        from src.ask_buddy import agent as agent_mod
+        monkeypatch.setenv("AGENT_SETTING_CONFIG", "settings.a.toml")
+        monkeypatch.setenv("MODEL_NAME", "model-a")
+        monkeypatch.setattr(db, "get_config_quality", lambda: [
+            {"config": "settings.a.toml:model-a", "rated": 40, "negative": 4,
+             "positive": 36, "negative_rate": 0.10},
+        ])
+        rec = agent_mod.recommend_agent_config()
+        assert rec["should_switch"] is False
+
+    def test_user_memory_block(self, monkeypatch):
+        import src.ask_buddy.db as db
+        from src.ask_buddy.agent import _user_memory_block
+        assert _user_memory_block(None) == ""
+        monkeypatch.setattr(db, "get_user_memories", lambda uid, limit=8: [])
+        assert _user_memory_block("U1") == ""
+        monkeypatch.setattr(db, "get_user_memories", lambda uid, limit=8:
+                            ["Works in the SF office", "On the parental-leave track"])
+        block = _user_memory_block("U1")
+        assert "SF office" in block and "parental-leave" in block
+
+
+# ===========================================================================
+# Point 5 — Slack UX (threaded follow-ups, App Home dashboard)
+# ===========================================================================
+
+class TestThreadedFollowups:
+    def test_thread_ts_included_in_post(self, monkeypatch):
+        import src.ask_buddy.slack_listener as sl
+        captured = {}
+        monkeypatch.setattr(sl.app.client, "chat_postMessage",
+                            lambda **kwargs: captured.update(kwargs))
+        # avoid DB writes for the pending feedback row
+        import src.ask_buddy.feedback as fb
+        monkeypatch.setattr(fb, "store_feedback_row", lambda *a, **kw: None)
+
+        sl._post_answer_with_feedback("C1", "hello", "q", thread_ts="123.456")
+        assert captured.get("thread_ts") == "123.456"
+
+    def test_no_thread_ts_key_when_absent(self, monkeypatch):
+        import src.ask_buddy.slack_listener as sl
+        captured = {}
+        monkeypatch.setattr(sl.app.client, "chat_postMessage",
+                            lambda **kwargs: captured.update(kwargs))
+        import src.ask_buddy.feedback as fb
+        monkeypatch.setattr(fb, "store_feedback_row", lambda *a, **kw: None)
+        sl._post_answer_with_feedback("C1", "hi", "q")
+        assert "thread_ts" not in captured
+
+
+class TestAppHomeView:
+    def test_home_view_structure(self, monkeypatch):
+        import src.ask_buddy.slack_listener as sl
+        import src.ask_buddy.db as db
+        import src.ask_buddy.git_watch as gw
+        monkeypatch.setattr(db, "get_feedback_summary",
+                            lambda: {"total": 10, "positive": 7, "negative": 2, "unrated": 1})
+        monkeypatch.setattr(db, "get_eval_run_history",
+                            lambda limit=1: [{"run_id": "r", "total": 5, "passed": 4, "avg_score": 0.8}])
+        monkeypatch.setattr(gw, "_watched_repos", lambda: ["a/b"])
+        monkeypatch.setattr(db, "get_git_watermark",
+                            lambda repo: {"last_issue_number": 3, "last_pr_number": 2})
+        monkeypatch.setattr(db, "get_github_login", lambda uid: "octocat")
+        monkeypatch.setattr(db, "get_user_memories", lambda uid, limit=5: ["Works in SF"])
+
+        view = sl._build_home_view("U1")
+        assert view["type"] == "home"
+        import json
+        text = json.dumps(view)
+        assert "Ask Buddy" in text
+        assert "Helpful rate" in text
+        assert "octocat" in text

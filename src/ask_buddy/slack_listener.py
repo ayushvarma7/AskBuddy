@@ -97,6 +97,21 @@ try:
 except Exception as _e:
     log.warning("Could not initialise git-identities schema: %s", _e)
 
+# Ensure the newer feature tables exist at startup (idempotent):
+#   digest history (trends), PR-nudge dedup, per-user memory, eval runs.
+for _init_name in (
+    "init_git_digest_history_schema",
+    "init_pr_nudge_schema",
+    "init_user_memory_schema",
+    "init_eval_runs_schema",
+):
+    try:
+        from . import db as _db
+        getattr(_db, _init_name)()
+        log.info("%s ok.", _init_name)
+    except Exception as _e:
+        log.warning("Could not run %s: %s", _init_name, _e)
+
 
 # ---------------------------------------------------------------------------
 # Channel name -> ID resolution (needed by the scheduler_agent's reminder
@@ -175,7 +190,8 @@ def _evict_idle_supervisors() -> None:
 
 
 def _stash_pending_approval(thread_id: str, supervisor, channel: str, user_text: str,
-                            agent_config: str, retrieved_chunk_ids: list[int]) -> None:
+                            agent_config: str, retrieved_chunk_ids: list[int],
+                            thread_ts: str | None = None) -> None:
     with _pending_approvals_lock:
         _pending_approvals[thread_id] = {
             "supervisor": supervisor,
@@ -183,6 +199,7 @@ def _stash_pending_approval(thread_id: str, supervisor, channel: str, user_text:
             "user_text": user_text,
             "agent_config": agent_config,
             "retrieved_chunk_ids": list(retrieved_chunk_ids),
+            "thread_ts": thread_ts,
             "created_at": time.time(),
         }
 
@@ -326,6 +343,27 @@ try:
 except Exception as _e:
     log.warning("Could not start git digest: %s", _e)
 
+# Stale-PR nudger (DMs reviewers about PRs waiting too long for review)
+try:
+    from .git_stale import start_git_stale
+    start_git_stale(_plain_post)
+except Exception as _e:
+    log.warning("Could not start stale-PR nudger: %s", _e)
+
+# Weekly per-user proactive digest (DMs linked users their PRs + policy spotlight)
+try:
+    from .personal_digest import start_personal_digest
+    start_personal_digest(_plain_post)
+except Exception as _e:
+    log.warning("Could not start personal digest: %s", _e)
+
+# Nightly LLM-as-judge retrieval eval (self-tuning quality signal)
+try:
+    from .eval_runner import start_eval_scheduler
+    start_eval_scheduler(_plain_post)
+except Exception as _e:
+    log.warning("Could not start nightly eval: %s", _e)
+
 # Sweep pending GitHub write-action approvals that were never confirmed
 try:
     _start_approval_sweep()
@@ -347,6 +385,7 @@ def _post_answer_with_feedback(
     question: str,
     retrieved_chunk_ids: list[int] | None = None,
     agent_config: str | None = None,
+    thread_ts: str | None = None,
 ) -> None:
     """
     Post the answer as a Block Kit message with 👍 / 👎 buttons,
@@ -355,6 +394,9 @@ def _post_answer_with_feedback(
     Refusals are tagged is_refusal=TRUE and store no chunk IDs (the agent
     refuses without using retrieval), so downstream chunk-quality scoring
     only counts real answers.
+
+    When thread_ts is set the reply lands in that Slack thread, so a channel
+    conversation stays threaded instead of flat.
     """
     from .feedback import (
         new_response_id, build_answer_blocks,
@@ -378,11 +420,22 @@ def _post_answer_with_feedback(
         log.warning("[feedback] could not store pending row:\n%s",
                     traceback.format_exc())
 
-    app.client.chat_postMessage(
-        channel=channel,
-        text=answer_text,          # fallback for notifications
-        blocks=blocks,
-    )
+    _post_kwargs = {"channel": channel, "text": answer_text, "blocks": blocks}
+    if thread_ts:
+        _post_kwargs["thread_ts"] = thread_ts
+    try:
+        app.client.chat_postMessage(**_post_kwargs)
+    except Exception as _post_err:
+        from slack_sdk.errors import SlackApiError
+        if isinstance(_post_err, SlackApiError) and _post_err.response.get("error") == "channel_not_found":
+            log.error(
+                "[feedback] channel_not_found for channel=%s — "
+                "the bot must be invited to the channel first "
+                "(run `/invite @AskBuddy` in that channel).",
+                channel,
+            )
+        else:
+            raise
     log.info("[feedback] posted response_id=%s refusal=%s chunks=%s",
              response_id, refusal, chunk_ids)
 
@@ -412,12 +465,18 @@ def _run_agent_for_message(user_text: str, channel: str, user: str,
             ch, text, user_text,
             retrieved_chunk_ids=list(retrieved_chunk_ids),
             agent_config=agent_config,
+            thread_ts=thread_ts,
         )
         posted_answers.append(text)
 
-    # Stable thread_id per (channel, user) — the supervisor cache key and the
-    # key used for the approval stash after a pause.
-    thread_id = f"slack-{channel}-{user}"
+    # thread_id keys both the supervisor cache and the approval stash. When the
+    # message is in a Slack thread, key per-thread so each thread is its own
+    # conversation with isolated memory; otherwise key per (channel, user) so a
+    # flat DM stays one continuous conversation.
+    if thread_ts:
+        thread_id = f"slack-{channel}-{thread_ts}"
+    else:
+        thread_id = f"slack-{channel}-{user}"
 
     prompt = (
         f"A Slack user (id: {user}) in channel {channel} asks:\n\n"
@@ -433,10 +492,12 @@ def _run_agent_for_message(user_text: str, channel: str, user: str,
         from .retrieve import _hybrid_retrieve_core
         chunks = _hybrid_retrieve_core(user_text, top_k=5)
         if chunks and "error" in chunks[0]:
-            raise RuntimeError(f"retrieve error: {chunks[0]['error']}")
-        retrieved_chunk_ids[:] = [c["id"] for c in chunks if "id" in c]
-        log.info("[supervisor] pre-retrieved %d chunks: %s",
-                 len(chunks), [c.get("source_filename") for c in chunks])
+            log.warning("[supervisor] pre-retrieval error (non-fatal): %s",
+                        chunks[0]["error"])
+        else:
+            retrieved_chunk_ids[:] = [c["id"] for c in chunks if "id" in c]
+            log.info("[supervisor] pre-retrieved %d chunks: %s",
+                     len(chunks), [c.get("source_filename") for c in chunks])
 
         supervisor = _get_or_build_supervisor(
             thread_id,
@@ -455,7 +516,7 @@ def _run_agent_for_message(user_text: str, channel: str, user: str,
         if answer and PAUSED_MARKER in answer:
             _stash_pending_approval(
                 thread_id, supervisor, channel, user_text,
-                agent_config, retrieved_chunk_ids,
+                agent_config, retrieved_chunk_ids, thread_ts=thread_ts,
             )
             blocks = _build_approval_blocks(
                 thread_id,
@@ -463,11 +524,14 @@ def _run_agent_for_message(user_text: str, channel: str, user: str,
                 "GitHub* (e.g. merging a pull request or closing an issue).",
                 action_summary=user_text[:120],
             )
-            app.client.chat_postMessage(
-                channel=channel,
-                text="Confirmation needed before this action runs.",
-                blocks=blocks,
-            )
+            _approval_kwargs = {
+                "channel": channel,
+                "text": "Confirmation needed before this action runs.",
+                "blocks": blocks,
+            }
+            if thread_ts:
+                _approval_kwargs["thread_ts"] = thread_ts
+            app.client.chat_postMessage(**_approval_kwargs)
             return
 
         if answer and not posted_answers:
@@ -475,13 +539,17 @@ def _run_agent_for_message(user_text: str, channel: str, user: str,
 
     except Exception:
         log.error("[supervisor] UNHANDLED EXCEPTION:\n%s", traceback.format_exc())
-        app.client.chat_postMessage(
-            channel=channel,
-            text=(
-                "⚠️ Something went wrong looking that up — "
-                "check the bot logs for the full error."
-            ),
-        )
+        try:
+            app.client.chat_postMessage(
+                channel=channel,
+                text=(
+                    "⚠️ Something went wrong looking that up — "
+                    "check the bot logs for the full error."
+                ),
+            )
+        except Exception:
+            log.error("[supervisor] could not post error message to channel=%s:\n%s",
+                      channel, traceback.format_exc())
 
 
 # ---------------------------------------------------------------------------
@@ -497,15 +565,18 @@ def handle_dm_message(event, say, logger):
     user_text: str = event.get("text", "").strip()
     channel: str = event["channel"]
     user: str = event.get("user", "unknown")
+    # A DM can itself be threaded; preserve the thread so follow-ups in that
+    # thread continue the same conversation.
+    thread_ts: str | None = event.get("thread_ts")
 
     if not user_text:
         return
 
-    say(text="⏳ Looking that up…", channel=channel)
+    say(text="⏳ Looking that up…", channel=channel, thread_ts=thread_ts)
 
     t = threading.Thread(
         target=_run_agent_for_message,
-        args=(user_text, channel, user),
+        args=(user_text, channel, user, thread_ts),
         daemon=True,
     )
     t.start()
@@ -590,7 +661,11 @@ def handle_slash_command(ack, command, respond):
             "*Subcommands*\n"
             "  `/askbuddy git digest` — post a full repo state digest now\n"
             "  `/askbuddy git digest owner/repo` — digest for one specific repo\n"
+            "  `/askbuddy pr card owner/repo #17` — interactive merge-readiness card\n"
             "  `/askbuddy link github <your-login>` — link your GitHub account\n"
+            "  `/askbuddy remember <fact>` — teach me a durable fact about you\n"
+            "  `/askbuddy forget me` — clear everything I remember about you\n"
+            "  `/askbuddy config` — best agent config by feedback so far\n"
             "  `/askbuddy status` — show watched repos and current watermarks\n"
             "  `/askbuddy help` — this message"
         )
@@ -637,11 +712,101 @@ def handle_slash_command(ack, command, respond):
             respond("⚠️ Could not save that link — check bot logs.")
         return
 
+    # /askbuddy pr card owner/repo #N   (also: "merge card …")
+    # Posts an interactive merge-readiness card with Merge buttons.
+    if lower.startswith(("pr card", "merge card")):
+        import re as _re
+        repo_m = _re.search(r"([\w.-]+/[\w.-]+)", user_text)
+        # Strip the repo before hunting for the PR number so a digit inside the
+        # repo name (e.g. 'acme2/backend') can't be mistaken for the number.
+        remainder = user_text.replace(repo_m.group(1), " ") if repo_m else user_text
+        num_m = _re.search(r"(\d+)", remainder)
+        if not repo_m or not num_m:
+            respond("Usage: `/askbuddy pr card owner/repo #17`")
+            return
+        repo = repo_m.group(1)
+        number = int(num_m.group(1))
+
+        def _run_card():
+            try:
+                from .git_ui import fetch_merge_card
+                fallback, blocks = fetch_merge_card(repo, number)
+                app.client.chat_postMessage(channel=channel, text=fallback, blocks=blocks)
+            except Exception:
+                log.exception("[merge_card] failed for %s#%s", repo, number)
+                app.client.chat_postMessage(
+                    channel=channel,
+                    text=f"⚠️ Couldn't load PR #{number} in `{repo}` — check the repo/number and bot logs.",
+                )
+
+        respond("⏳ Building merge-readiness card…")
+        threading.Thread(target=_run_card, daemon=True).start()
+        return
+
+    # /askbuddy remember <fact about me>
+    if lower.startswith("remember "):
+        fact = user_text.split(None, 1)[1].strip()
+        if not fact:
+            respond("Usage: `/askbuddy remember I work in the SF office`")
+            return
+        from .db import add_user_memory
+        try:
+            add_user_memory(user, fact)
+            respond(f"✅ Noted — I'll remember: _{fact}_")
+        except Exception:
+            log.exception("[user_memory] failed to store fact for %s", user)
+            respond("⚠️ Couldn't save that — check bot logs.")
+        return
+
+    # /askbuddy forget me
+    if lower in ("forget me", "forget"):
+        from .db import clear_user_memory
+        try:
+            removed = clear_user_memory(user)
+            respond(f"🧹 Cleared {removed} remembered fact(s) about you.")
+        except Exception:
+            log.exception("[user_memory] failed to clear facts for %s", user)
+            respond("⚠️ Couldn't clear your facts — check bot logs.")
+        return
+
+    # /askbuddy config  — show the best-performing agent config from feedback
+    if lower == "config":
+        from .agent import recommend_agent_config
+        rec = recommend_agent_config()
+        if rec["negative_rate"] is None:
+            respond("Not enough rated feedback yet to recommend a config.")
+            return
+        verdict = ("👉 *Consider switching* — set `AGENT_SETTING_CONFIG` / `MODEL_NAME` accordingly."
+                   if rec["should_switch"] else "✅ Current config is the best so far.")
+        lines = [f"*Agent config recommendation*",
+                 f"• Current: `{rec['current']}`",
+                 f"• Best by feedback: `{rec['best']}` ({rec['negative_rate']*100:.0f}% negative)",
+                 verdict, "", "_Candidates (min 20 rated):_"]
+        for c in rec["candidates"][:5]:
+            lines.append(f"  • `{c['config']}` — {c['negative_rate']*100:.0f}% neg ({c['rated']} rated)")
+        respond("\n".join(lines))
+        return
+
     # ---------------------------------------------------------------------------
     # All other text → route to the agent as normal
     # ---------------------------------------------------------------------------
 
-    respond("⏳ Looking that up…")
+    # Post the question publicly so it's visible in the channel, then a
+    # loading indicator.  Fall back to ephemeral respond() if the bot isn't
+    # a member of the channel (e.g. a private channel the bot hasn't joined).
+    try:
+        app.client.chat_postMessage(
+            channel=channel,
+            text=f"<@{user}> asked: {user_text}",
+        )
+        app.client.chat_postMessage(
+            channel=channel,
+            text="⏳ Looking that up…",
+        )
+    except Exception:
+        from slack_sdk.errors import SlackApiError
+        log.warning("[slash] could not post question to channel=%s, falling back to ephemeral", channel)
+        respond(f"⏳ Looking that up… _(question: {user_text})_")
 
     t = threading.Thread(
         target=_run_agent_for_message,
@@ -859,20 +1024,23 @@ def _resume_after_approval(pending: dict, thread_id: str, confirmed: bool,
         )
         answer = getattr(result, "answer", None)
 
+        _thread_ts = pending.get("thread_ts")
         if answer and PAUSED_MARKER in answer:
             # Chained approval (rare — e.g. two gated tools in one turn).
             # Stash again and prompt once more instead of dropping it.
             _stash_pending_approval(
                 thread_id, supervisor, channel,
                 pending["user_text"], pending["agent_config"],
-                pending["retrieved_chunk_ids"],
+                pending["retrieved_chunk_ids"], thread_ts=_thread_ts,
             )
             blocks = _build_approval_blocks(
                 thread_id, "⚠️ *One more confirmation needed before this completes.*",
             )
-            app.client.chat_postMessage(
-                channel=channel, text="Another confirmation needed.", blocks=blocks,
-            )
+            _chain_kwargs = {"channel": channel,
+                             "text": "Another confirmation needed.", "blocks": blocks}
+            if _thread_ts:
+                _chain_kwargs["thread_ts"] = _thread_ts
+            app.client.chat_postMessage(**_chain_kwargs)
             return
 
         if not answer:
@@ -883,6 +1051,7 @@ def _resume_after_approval(pending: dict, thread_id: str, confirmed: bool,
             channel, answer, pending["user_text"],
             retrieved_chunk_ids=pending["retrieved_chunk_ids"],
             agent_config=pending["agent_config"],
+            thread_ts=_thread_ts,
         )
     except Exception:
         log.error("[git_approval] UNHANDLED EXCEPTION resuming thread=%s:\n%s",
@@ -891,6 +1060,176 @@ def _resume_after_approval(pending: dict, thread_id: str, confirmed: bool,
             channel=channel,
             text="⚠️ Something went wrong completing that action — check the bot logs.",
         )
+
+
+# ---------------------------------------------------------------------------
+# Interactive merge-readiness card handlers (point 3)
+# ---------------------------------------------------------------------------
+
+def _parse_action_value(body: dict) -> dict | None:
+    try:
+        return json.loads(body["actions"][0]["value"])
+    except (KeyError, IndexError, json.JSONDecodeError):
+        log.warning("[merge_card] could not parse action value")
+        return None
+
+
+@app.action("pr_merge_request")
+def handle_pr_merge_request(body, ack):
+    """First click on a Merge button — replace card with a Confirm/Cancel step."""
+    ack()
+    data = _parse_action_value(body)
+    if data is None:
+        return
+    from .git_ui import build_merge_confirm_card
+    app.client.chat_update(
+        channel=body["channel"]["id"], ts=body["message"]["ts"],
+        text="Confirm merge?",
+        blocks=build_merge_confirm_card(data["number"], data["repo"],
+                                        data.get("method", "squash")),
+    )
+
+
+@app.action("pr_merge_cancel")
+def handle_pr_merge_cancel(body, ack):
+    ack()
+    from .git_ui import build_result_blocks
+    app.client.chat_update(
+        channel=body["channel"]["id"], ts=body["message"]["ts"],
+        text="Merge cancelled.",
+        blocks=build_result_blocks("❌ _Merge cancelled — nothing changed on GitHub._"),
+    )
+
+
+@app.action("pr_merge_confirm")
+def handle_pr_merge_confirm(body, ack):
+    """Confirmed — run the gated merge in a background thread, update the card."""
+    ack()
+    data = _parse_action_value(body)
+    if data is None:
+        return
+    channel = body["channel"]["id"]
+    ts = body["message"]["ts"]
+    user_id = body["user"]["id"]
+    method = data.get("method", "squash")
+
+    from .git_ui import build_result_blocks
+    app.client.chat_update(
+        channel=channel, ts=ts, text="Merging…",
+        blocks=build_result_blocks(
+            f"⏳ _Merging PR #{data['number']} (requested by <@{user_id}>)…_"),
+    )
+
+    def _do_merge():
+        from . import github_client as gh
+        try:
+            res = gh.merge_pull_request(data["repo"], data["number"], method)
+            if res.get("merged"):
+                txt = (f"✅ *Merged PR #{data['number']}* in `{data['repo']}` "
+                       f"via `{method}` (by <@{user_id}>).")
+            else:
+                txt = (f"⚠️ GitHub declined to merge PR #{data['number']}: "
+                       f"{res.get('message', 'no reason given')}")
+        except gh.GitHubError as e:
+            txt = f"⚠️ Merge failed: {e}"
+        except Exception:
+            log.exception("[merge_card] merge failed for %s#%s", data["repo"], data["number"])
+            txt = "⚠️ Merge failed — check bot logs."
+        app.client.chat_update(channel=channel, ts=ts, text=txt,
+                               blocks=build_result_blocks(txt))
+
+    threading.Thread(target=_do_merge, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# App Home dashboard (point 5) — feedback health + watcher status at a glance
+# ---------------------------------------------------------------------------
+
+def _build_home_view(user_id: str) -> dict:
+    blocks: list[dict] = [
+        {"type": "header",
+         "text": {"type": "plain_text", "text": "🤖 Ask Buddy", "emoji": True}},
+        {"type": "context",
+         "elements": [{"type": "mrkdwn",
+                       "text": "Your workplace assistant — HR/IT policy, GitHub, reminders."}]},
+        {"type": "divider"},
+    ]
+
+    # Feedback health
+    try:
+        from .db import get_feedback_summary
+        s = get_feedback_summary()
+        rated = s["positive"] + s["negative"]
+        pos_pct = (s["positive"] / rated * 100) if rated else 0
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": (
+            f"*📊 Answer feedback*\n"
+            f"• Total answers: *{s['total']}*\n"
+            f"• 👍 {s['positive']}  ·  👎 {s['negative']}  ·  unrated {s['unrated']}\n"
+            f"• Helpful rate: *{pos_pct:.0f}%*")}})
+    except Exception:
+        blocks.append({"type": "section",
+                       "text": {"type": "mrkdwn", "text": "*📊 Answer feedback*\n_unavailable_"}})
+
+    # Latest nightly eval
+    try:
+        from .db import get_eval_run_history
+        hist = get_eval_run_history(limit=1)
+        if hist and hist[0]["total"]:
+            h = hist[0]
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": (
+                f"*🧪 Latest retrieval eval*\n"
+                f"• Pass rate: *{h['passed']}/{h['total']}*\n"
+                f"• Avg judge score: *{round(h['avg_score'], 2) if h['avg_score'] is not None else 'n/a'}*")}})
+    except Exception:
+        pass
+
+    # Watched repos + watermarks
+    try:
+        from .git_watch import _watched_repos
+        from .db import get_git_watermark
+        repos = _watched_repos()
+        if repos:
+            lines = ["*🔭 Watched repos*"]
+            for repo in repos:
+                try:
+                    wm = get_git_watermark(repo)
+                    lines.append(f"• `{repo}` — issue #{wm['last_issue_number']}, PR #{wm['last_pr_number']}")
+                except Exception:
+                    lines.append(f"• `{repo}`")
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)}})
+    except Exception:
+        pass
+
+    # Personalisation for this user
+    try:
+        from .db import get_github_login, get_user_memories
+        login = get_github_login(user_id)
+        facts = get_user_memories(user_id, limit=5)
+        parts = ["*🙋 You*"]
+        parts.append(f"• GitHub: `{login}`" if login
+                     else "• GitHub: _not linked_ — `/askbuddy link github <login>`")
+        if facts:
+            parts.append("• I remember: " + "; ".join(f[:60] for f in facts))
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(parts)}})
+    except Exception:
+        pass
+
+    blocks.append({"type": "divider"})
+    blocks.append({"type": "context", "elements": [{"type": "mrkdwn",
+                   "text": "Type `/askbuddy help` for everything I can do."}]})
+    return {"type": "home", "blocks": blocks}
+
+
+@app.event("app_home_opened")
+def handle_app_home_opened(event, client):
+    """Render the App Home dashboard when a user opens the bot's Home tab."""
+    user_id = event.get("user")
+    if not user_id:
+        return
+    try:
+        client.views_publish(user_id=user_id, view=_build_home_view(user_id))
+    except Exception:
+        log.warning("[home] could not publish home view:\n%s", traceback.format_exc())
 
 
 # ---------------------------------------------------------------------------

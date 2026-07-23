@@ -104,6 +104,91 @@ _GIT_IDENTITIES_TABLE_DDL = """
         github_login   TEXT NOT NULL,
         linked_at      TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+
+    -- Reverse lookup (github_login -> slack_user_id) for the stale-PR nudger.
+    CREATE INDEX IF NOT EXISTS ask_buddy_git_identities_login_idx
+        ON ask_buddy_git_identities (lower(github_login));
+"""
+
+
+# ---------------------------------------------------------------------------
+# Git digest history (point 3 — weekly trend deltas, not just a snapshot)
+# ---------------------------------------------------------------------------
+# One row per digest run per repo. Lets the digest report deltas ("+3 open
+# issues since last week", "review latency down 1.2 days") instead of a
+# point-in-time snapshot.
+_GIT_DIGEST_HISTORY_DDL = """
+    CREATE TABLE IF NOT EXISTS ask_buddy_git_digest_history (
+        id                       SERIAL PRIMARY KEY,
+        repo                     TEXT        NOT NULL,
+        open_issues              INTEGER     NOT NULL DEFAULT 0,
+        closed_issues            INTEGER     NOT NULL DEFAULT 0,
+        open_prs                 INTEGER     NOT NULL DEFAULT 0,
+        closed_prs               INTEGER     NOT NULL DEFAULT 0,
+        draft_prs                INTEGER     NOT NULL DEFAULT 0,
+        review_needed            INTEGER     NOT NULL DEFAULT 0,
+        avg_review_latency_hours REAL,
+        captured_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS ask_buddy_git_digest_history_repo_idx
+        ON ask_buddy_git_digest_history (repo, captured_at DESC);
+"""
+
+
+# ---------------------------------------------------------------------------
+# Stale-PR nudge dedup (point 3 — don't re-nudge the same PR every poll)
+# ---------------------------------------------------------------------------
+_PR_NUDGE_TABLE_DDL = """
+    CREATE TABLE IF NOT EXISTS ask_buddy_pr_nudges (
+        repo            TEXT        NOT NULL,
+        pr_number       INTEGER     NOT NULL,
+        last_nudged_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (repo, pr_number)
+    );
+"""
+
+
+# ---------------------------------------------------------------------------
+# Per-user memory (point 4 — durable personalization facts)
+# ---------------------------------------------------------------------------
+# Small freeform facts the bot has learned about a Slack user (office, team,
+# leave track, …). Injected into the supervisor prompt so answers personalise
+# without re-asking. Kept deliberately tiny and user-scoped.
+_USER_MEMORY_TABLE_DDL = """
+    CREATE TABLE IF NOT EXISTS ask_buddy_user_memory (
+        id             SERIAL PRIMARY KEY,
+        slack_user_id  TEXT        NOT NULL,
+        fact           TEXT        NOT NULL,
+        created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS ask_buddy_user_memory_user_idx
+        ON ask_buddy_user_memory (slack_user_id, created_at DESC);
+"""
+
+
+# ---------------------------------------------------------------------------
+# Nightly eval runs (point 4 — LLM-as-judge regression tracking over time)
+# ---------------------------------------------------------------------------
+_EVAL_RUNS_TABLE_DDL = """
+    CREATE TABLE IF NOT EXISTS ask_buddy_eval_runs (
+        id            SERIAL PRIMARY KEY,
+        run_id        TEXT        NOT NULL,
+        question      TEXT        NOT NULL,
+        passed        BOOLEAN     NOT NULL DEFAULT FALSE,
+        score         REAL,
+        got_sources   TEXT,
+        expected_srcs TEXT,
+        judge_notes   TEXT,
+        agent_config  TEXT,
+        run_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS ask_buddy_eval_runs_run_idx
+        ON ask_buddy_eval_runs (run_id);
+    CREATE INDEX IF NOT EXISTS ask_buddy_eval_runs_time_idx
+        ON ask_buddy_eval_runs (run_at DESC);
 """
 
 
@@ -224,6 +309,14 @@ def init_schema() -> None:
     """ + _GIT_WATCH_TABLE_DDL + """
     -- Slack user -> GitHub login identity mapping
     """ + _GIT_IDENTITIES_TABLE_DDL + """
+    -- Git digest history (trend deltas)
+    """ + _GIT_DIGEST_HISTORY_DDL + """
+    -- Stale-PR nudge dedup
+    """ + _PR_NUDGE_TABLE_DDL + """
+    -- Per-user memory
+    """ + _USER_MEMORY_TABLE_DDL + """
+    -- Nightly eval runs
+    """ + _EVAL_RUNS_TABLE_DDL + """
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -261,6 +354,229 @@ def get_github_login(slack_user_id: str) -> str | None:
             )
             row = cur.fetchone()
             return row["github_login"] if row else None
+
+
+def get_slack_user_for_github_login(github_login: str) -> str | None:
+    """Reverse of get_github_login: GitHub login -> Slack user id (case-insensitive).
+    Used by the stale-PR nudger to DM the human behind a requested reviewer."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT slack_user_id FROM ask_buddy_git_identities "
+                "WHERE lower(github_login) = lower(%s) LIMIT 1;",
+                (github_login,),
+            )
+            row = cur.fetchone()
+            return row["slack_user_id"] if row else None
+
+
+def all_linked_slack_users() -> list[dict]:
+    """Return every (slack_user_id, github_login) mapping — used by the
+    per-user proactive digest to know who to DM."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT slack_user_id, github_login FROM ask_buddy_git_identities "
+                "ORDER BY linked_at;"
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Git digest history (trend deltas)
+# ---------------------------------------------------------------------------
+
+def init_git_digest_history_schema() -> None:
+    """Idempotent: create just the digest-history table. Safe at bot startup."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(_GIT_DIGEST_HISTORY_DDL)
+
+
+def insert_digest_snapshot(repo: str, stats: dict) -> None:
+    """Persist one digest snapshot so the next run can compute deltas.
+    `stats` keys mirror the digest columns (missing keys default to 0/NULL)."""
+    sql = """
+        INSERT INTO ask_buddy_git_digest_history
+            (repo, open_issues, closed_issues, open_prs, closed_prs,
+             draft_prs, review_needed, avg_review_latency_hours)
+        VALUES
+            (%(repo)s, %(open_issues)s, %(closed_issues)s, %(open_prs)s,
+             %(closed_prs)s, %(draft_prs)s, %(review_needed)s,
+             %(avg_review_latency_hours)s);
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, {
+                "repo": repo,
+                "open_issues": stats.get("open_issues", 0),
+                "closed_issues": stats.get("closed_issues", 0),
+                "open_prs": stats.get("open_prs", 0),
+                "closed_prs": stats.get("closed_prs", 0),
+                "draft_prs": stats.get("draft_prs", 0),
+                "review_needed": stats.get("review_needed", 0),
+                "avg_review_latency_hours": stats.get("avg_review_latency_hours"),
+            })
+
+
+def get_last_digest_snapshot(repo: str) -> dict | None:
+    """Return the most recent stored snapshot for a repo, or None if none yet."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT open_issues, closed_issues, open_prs, closed_prs, "
+                "draft_prs, review_needed, avg_review_latency_hours, captured_at "
+                "FROM ask_buddy_git_digest_history "
+                "WHERE repo = %s ORDER BY captured_at DESC LIMIT 1;",
+                (repo,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Stale-PR nudge dedup
+# ---------------------------------------------------------------------------
+
+def init_pr_nudge_schema() -> None:
+    """Idempotent: create just the PR-nudge dedup table. Safe at bot startup."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(_PR_NUDGE_TABLE_DDL)
+
+
+def get_last_nudge_epoch(repo: str, pr_number: int) -> float | None:
+    """Return the epoch seconds of the last nudge for a PR, or None if never."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT extract(epoch FROM last_nudged_at) AS epoch "
+                "FROM ask_buddy_pr_nudges WHERE repo = %s AND pr_number = %s;",
+                (repo, pr_number),
+            )
+            row = cur.fetchone()
+            return float(row["epoch"]) if row and row["epoch"] is not None else None
+
+
+def record_pr_nudge(repo: str, pr_number: int) -> None:
+    """Upsert last_nudged_at = now() for a PR."""
+    sql = """
+        INSERT INTO ask_buddy_pr_nudges (repo, pr_number, last_nudged_at)
+        VALUES (%(repo)s, %(pr)s, now())
+        ON CONFLICT (repo, pr_number) DO UPDATE SET last_nudged_at = now();
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, {"repo": repo, "pr": pr_number})
+
+
+# ---------------------------------------------------------------------------
+# Per-user memory
+# ---------------------------------------------------------------------------
+
+def init_user_memory_schema() -> None:
+    """Idempotent: create just the user-memory table. Safe at bot startup."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(_USER_MEMORY_TABLE_DDL)
+
+
+def add_user_memory(slack_user_id: str, fact: str) -> int:
+    """Store one fact about a user. De-dups exact repeats. Returns the row id
+    (or the existing id when the fact is a verbatim repeat)."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM ask_buddy_user_memory "
+                "WHERE slack_user_id = %s AND fact = %s LIMIT 1;",
+                (slack_user_id, fact),
+            )
+            existing = cur.fetchone()
+            if existing:
+                return existing["id"]
+            cur.execute(
+                "INSERT INTO ask_buddy_user_memory (slack_user_id, fact) "
+                "VALUES (%s, %s) RETURNING id;",
+                (slack_user_id, fact),
+            )
+            return cur.fetchone()["id"]
+
+
+def get_user_memories(slack_user_id: str, limit: int = 10) -> list[str]:
+    """Return a user's most recent stored facts (newest first)."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT fact FROM ask_buddy_user_memory WHERE slack_user_id = %s "
+                "ORDER BY created_at DESC LIMIT %s;",
+                (slack_user_id, limit),
+            )
+            return [r["fact"] for r in cur.fetchall()]
+
+
+def clear_user_memory(slack_user_id: str) -> int:
+    """Delete all stored facts for a user. Returns the number of rows removed."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM ask_buddy_user_memory WHERE slack_user_id = %s;",
+                (slack_user_id,),
+            )
+            return cur.rowcount
+
+
+# ---------------------------------------------------------------------------
+# Nightly eval runs
+# ---------------------------------------------------------------------------
+
+def init_eval_runs_schema() -> None:
+    """Idempotent: create just the eval-runs table. Safe at bot startup."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(_EVAL_RUNS_TABLE_DDL)
+
+
+def insert_eval_result(run_id: str, question: str, passed: bool,
+                       score: float | None, got_sources: str,
+                       expected_srcs: str, judge_notes: str,
+                       agent_config: str | None = None) -> None:
+    """Record one question's result from a nightly eval run."""
+    sql = """
+        INSERT INTO ask_buddy_eval_runs
+            (run_id, question, passed, score, got_sources, expected_srcs,
+             judge_notes, agent_config)
+        VALUES
+            (%(run_id)s, %(question)s, %(passed)s, %(score)s, %(got_sources)s,
+             %(expected_srcs)s, %(judge_notes)s, %(agent_config)s);
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, {
+                "run_id": run_id, "question": question, "passed": passed,
+                "score": score, "got_sources": got_sources,
+                "expected_srcs": expected_srcs, "judge_notes": judge_notes,
+                "agent_config": agent_config,
+            })
+
+
+def get_eval_run_history(limit: int = 10) -> list[dict]:
+    """Return per-run pass-rate summaries, newest run first. Used to spot
+    regressions across nightly runs."""
+    sql = """
+        SELECT run_id,
+               MIN(run_at)                                    AS run_at,
+               COUNT(*)                                       AS total,
+               COUNT(*) FILTER (WHERE passed)                 AS passed,
+               AVG(score)                                     AS avg_score
+        FROM ask_buddy_eval_runs
+        GROUP BY run_id
+        ORDER BY run_at DESC
+        LIMIT %s;
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (limit,))
+            return [dict(r) for r in cur.fetchall()]
 
 
 def init_reminders_schema() -> None:
@@ -466,6 +782,67 @@ def get_positive_examples(limit: int = 3) -> list[dict]:
             return [dict(r) for r in cur.fetchall()]
 
 
+def get_feedback_summary() -> dict:
+    """Overall feedback counts for the App Home dashboard."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT COUNT(*)                                      AS total,
+                       COUNT(*) FILTER (WHERE feedback = 'positive')  AS positive,
+                       COUNT(*) FILTER (WHERE feedback = 'negative')  AS negative,
+                       COUNT(*) FILTER (WHERE feedback IS NULL)       AS unrated
+                FROM ask_buddy_feedback;
+            """)
+            r = dict(cur.fetchone())
+            return {k: int(r[k] or 0) for k in ("total", "positive", "negative", "unrated")}
+
+
+def count_positive_examples() -> int:
+    """Number of well-formed positive exemplars available (non-refusal, with a
+    Source(s) line). Drives the 'auto' few-shot count so the prompt grows as
+    the bot accumulates good answers."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(DISTINCT question) AS n FROM ask_buddy_feedback "
+                "WHERE feedback = 'positive' AND is_refusal = FALSE "
+                "AND answer_text ILIKE '%%Source(s):%%';"
+            )
+            return int(cur.fetchone()["n"] or 0)
+
+
+def get_config_quality() -> list[dict]:
+    """
+    Per-agent-config quality: rated count and negative rate. Used to auto-
+    recommend the best-performing LLM/agent config. Only configs with a
+    meaningful sample are actionable, so the caller applies a min-sample gate.
+    """
+    sql = """
+        SELECT COALESCE(agent_config, '(untagged)')         AS config,
+               COUNT(*) FILTER (WHERE feedback IS NOT NULL)  AS rated,
+               COUNT(*) FILTER (WHERE feedback = 'negative') AS negative,
+               COUNT(*) FILTER (WHERE feedback = 'positive') AS positive
+        FROM ask_buddy_feedback
+        GROUP BY config
+        ORDER BY rated DESC;
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            rows = []
+            for r in cur.fetchall():
+                rated = int(r["rated"] or 0)
+                neg = int(r["negative"] or 0)
+                rows.append({
+                    "config": r["config"],
+                    "rated": rated,
+                    "negative": neg,
+                    "positive": int(r["positive"] or 0),
+                    "negative_rate": (neg / rated) if rated else 0.0,
+                })
+            return rows
+
+
 def get_negative_feedback_rows(since_days: int | None = None) -> list[dict]:
     """
     Return negatively-rated rows (question, answer, reason, sources, refusal,
@@ -488,6 +865,22 @@ def get_negative_feedback_rows(since_days: int | None = None) -> list[dict]:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             return [dict(r) for r in cur.fetchall()]
+
+
+def get_random_chunk_spotlight(corpus: str | None = None) -> dict | None:
+    """Return a random chunk (source_filename, section, chunk_text) for the
+    weekly 'policy spotlight' DM. Returns None if the corpus is empty."""
+    sql = "SELECT source_filename, section, chunk_text FROM hr_chunks"
+    params: tuple = ()
+    if corpus:
+        sql += " WHERE corpus = %s"
+        params = (corpus,)
+    sql += " ORDER BY random() LIMIT 1;"
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            row = cur.fetchone()
+            return dict(row) if row else None
 
 
 def clear_chunks(corpus: str | None = None) -> None:

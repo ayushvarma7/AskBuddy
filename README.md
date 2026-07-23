@@ -409,6 +409,61 @@ All retrieval is scoped by the `corpus` column so HR and IT results never mix, e
 
 ---
 
+## Proactive & self-tuning features
+
+Beyond answering questions on demand, AskBuddy runs several background loops that
+push value out and improve itself over time. All are opt-in via environment
+variables and degrade gracefully (a missing DB or token disables the relevant
+loop without crashing the bot).
+
+### GitHub proactive intelligence
+
+- **Stale-PR nudger** (`git_stale.py`) — every `GIT_STALE_INTERVAL_HOURS` it scans
+  watched repos for non-draft PRs open longer than `GIT_STALE_PR_DAYS` with no
+  approval, and **DMs the actual human** behind each requested reviewer by
+  resolving their GitHub login back to a Slack user (the `/askbuddy link github`
+  mapping). Unlinked reviewers fall back to a channel post. A per-PR cooldown
+  (`GIT_STALE_COOLDOWN_HOURS`) prevents repeat pings.
+- **Interactive merge-readiness card** — `/askbuddy pr card owner/repo #17` posts a
+  Block Kit card showing draft/approval/CI status. When nothing is blocking it
+  offers **Squash & merge / Merge commit** buttons that flow through a confirm
+  step and the gated merge — the card is both the review surface and the action.
+- **Digest trends** — the daily digest now persists a snapshot per run and shows
+  deltas ("open issues ▲2 since Jul 16") plus an **average time-to-first-review**
+  latency signal.
+
+### Self-tuning feedback loop
+
+- **Auto few-shots** — set `ASK_BUDDY_FEWSHOT=auto` and the number of injected
+  exemplars scales with the pool of positively-rated answers (capped at 5).
+- **Config recommendation** — `/askbuddy config` reports the best-performing
+  `AGENT_SETTING_CONFIG:MODEL_NAME` by accumulated negative-feedback rate and
+  flags when it's worth switching.
+- **Nightly LLM-as-judge eval** (`eval_runner.py`) — replays the curated
+  `tests/regression_evals.json` cases through live retrieval, grades context
+  sufficiency with a Gemini judge, records results to `ask_buddy_eval_runs`, and
+  posts a pass-rate summary with a regression delta vs the previous run. Run
+  manually with `uv run python -m src.ask_buddy.eval_runner --dry-run`.
+
+### Slack surfaces
+
+- **Threaded follow-ups** — @mentions (and threaded DMs) are keyed per Slack
+  thread, so each thread is its own conversation with isolated memory. Replies
+  land in-thread, and follow-ups like "what about after 5 years?" keep context.
+- **Per-user memory** — `/askbuddy remember I work in the SF office` stores durable
+  facts (in `ask_buddy_user_memory`) that are injected into the supervisor prompt
+  so answers personalise without re-asking; `/askbuddy forget me` clears them.
+- **Weekly personal digest** (`personal_digest.py`) — DMs each linked user their
+  PRs needing attention plus a rotating policy spotlight (Monday 9 AM by default).
+- **App Home dashboard** — opening the bot's Home tab shows feedback health, the
+  latest eval pass-rate, watched-repo watermarks, and your personalisation state.
+
+New tables added for these: `ask_buddy_git_digest_history`, `ask_buddy_pr_nudges`,
+`ask_buddy_user_memory`, `ask_buddy_eval_runs` — all created idempotently at
+startup. See [`.env.example`](.env.example) for every new variable.
+
+---
+
 ## Troubleshooting
 
 **Bot starts but never replies to DMs**

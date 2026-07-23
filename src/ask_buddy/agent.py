@@ -240,16 +240,21 @@ When a user asks a question or gives a command:
 combine their answers.
 3. Requests to create/list/cancel a reminder always go to scheduler_agent, \
 never to hr_agent or it_agent.
-4. If the request is clearly outside all three domains (e.g. personal \
-advice, general trivia), respond directly with:
-   No results found in our documents for that question — please \
-reach out to the appropriate team for help.
-5. GitHub *issue* questions go to git_issue_agent; GitHub *pull request* / PR / \
-review / CI-check questions go to git_pr_agent. If a git question needs both \
+4. GitHub *issue* questions go to git_issue_agent; GitHub *pull request* / PR / \
+review / CI-check / merge questions go to git_pr_agent. \
+Any question that mentions a GitHub repository (formatted as 'owner/repo', \
+e.g. 'ayushvarma7/GitHub-Sample-Repo') or uses words like "pull request", \
+"PR", "merge", "branch", "commit", "issue", "CI", "check-run", "review" in \
+a software context MUST be routed to git_issue_agent or git_pr_agent — \
+NEVER treated as out-of-scope. If a git question needs both \
 (e.g. "summarize all activity on repo X"), delegate to both and combine. \
 Write actions (comment, label, assign, close/merge) go to the respective git \
 agent — high-risk actions (close/merge) will request Slack confirmation \
 automatically before executing.
+5. If the request is clearly outside ALL domains (e.g. personal \
+advice, general trivia, math questions), respond directly with:
+   No results found in our documents for that question — please \
+reach out to the appropriate team for help.
 
 Always deliver the final answer via post_slack_message.
 """
@@ -273,11 +278,33 @@ def _default_repo_block() -> str:
     )
 
 
-def _fewshot_block() -> str:
+def _auto_fewshot_count() -> int:
+    """
+    Number of few-shot exemplars to inject when ASK_BUDDY_FEWSHOT=auto.
+
+    Grows with the pool of well-formed positive answers so a fresh bot injects
+    nothing (no exemplars yet) and a seasoned one self-tunes up to a cap. One
+    exemplar per ~5 distinct liked questions, capped at 5.
+    """
     try:
-        n = int(os.environ.get("ASK_BUDDY_FEWSHOT", "0") or "0")
-    except ValueError:
-        n = 0
+        from .db import count_positive_examples
+        positives = count_positive_examples()
+    except Exception:
+        return 0
+    if positives < 3:
+        return 0
+    return max(1, min(5, positives // 5))
+
+
+def _fewshot_block() -> str:
+    raw = (os.environ.get("ASK_BUDDY_FEWSHOT", "0") or "0").strip().lower()
+    if raw == "auto":
+        n = _auto_fewshot_count()
+    else:
+        try:
+            n = int(raw)
+        except ValueError:
+            n = 0
     if n <= 0:
         return ""
 
@@ -310,6 +337,66 @@ def current_agent_config() -> str:
     setting = os.environ.get("AGENT_SETTING_CONFIG", "default")
     model = os.environ.get("MODEL_NAME", "default")
     return f"{setting}:{model}"
+
+
+def recommend_agent_config(min_sample: int = 20) -> dict:
+    """
+    Look at accumulated feedback per agent_config and recommend the best
+    performer (lowest negative rate) among configs with at least `min_sample`
+    rated answers. Returns {best, current, negative_rate, should_switch,
+    candidates}. This is the read side of the self-tuning loop — a scheduled
+    job (or a human) can act on `should_switch` by flipping AGENT_SETTING_CONFIG
+    / MODEL_NAME. We never hot-swap the LLM mid-process; we surface the signal.
+    """
+    current = current_agent_config()
+    try:
+        from .db import get_config_quality
+        rows = [r for r in get_config_quality() if r["rated"] >= min_sample]
+    except Exception:
+        rows = []
+    if not rows:
+        return {"best": current, "current": current, "negative_rate": None,
+                "should_switch": False, "candidates": []}
+    rows.sort(key=lambda r: r["negative_rate"])
+    best = rows[0]
+    cur_row = next((r for r in rows if r["config"] == current), None)
+    cur_rate = cur_row["negative_rate"] if cur_row else None
+    # Only recommend switching on a clear (>5 pt) improvement to avoid churn.
+    should_switch = (
+        best["config"] != current
+        and (cur_rate is None or best["negative_rate"] < cur_rate - 0.05)
+    )
+    return {
+        "best": best["config"],
+        "current": current,
+        "negative_rate": best["negative_rate"],
+        "should_switch": should_switch,
+        "candidates": rows,
+    }
+
+
+def _user_memory_block(user_id: str | None) -> str:
+    """
+    Prompt snippet listing durable facts the bot has learned about this user
+    (office, team, leave track, …). Injected so answers personalise without
+    re-asking. Empty when the user is unknown or has no stored facts.
+    """
+    if not user_id:
+        return ""
+    try:
+        from .db import get_user_memories
+        facts = get_user_memories(user_id, limit=8)
+    except Exception:
+        return ""
+    if not facts:
+        return ""
+    joined = "\n".join(f"- {f}" for f in facts)
+    return (
+        "\n\n== WHAT YOU KNOW ABOUT THIS USER ==\n"
+        "Use these facts to tailor the answer when relevant. Do NOT override a\n"
+        "document's policy with them, and never invent new facts about the user:\n"
+        + joined
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -777,7 +864,7 @@ def build_supervisor(
             "git_issue_agent": git_issue,
             "git_pr_agent": git_pr,
         },
-        special_instructions=SUPERVISOR_PROMPT,
+        special_instructions=SUPERVISOR_PROMPT + _user_memory_block(created_by),
     )
     return supervisor
 
