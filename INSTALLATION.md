@@ -53,8 +53,8 @@ Download from **https://www.docker.com/products/docker-desktop/**
 ## 2. Clone and Install Dependencies
 
 ```bash
-git clone <your-repo-url> meeting-scribe
-cd meeting-scribe
+git clone <your-repo-url> ask-buddy
+cd ask-buddy
 
 # Install all Python dependencies into a local virtual environment
 uv sync
@@ -534,7 +534,7 @@ The report now also breaks out:
 - **Content-review queue** — chunks that accumulated 3+ thumbs-down across the
   answers that cited them; the underlying HR text may be wrong or ambiguous.
 - **Negative rate by agent config** — a built-in A/B view if you run different
-  model configs (see the per-node model split in README_ASKBUDDY.md).
+  model configs (`AGENT_SETTING_CONFIG` / `MODEL_NAME`).
 
 Optional flags:
 ```bash
@@ -542,11 +542,21 @@ Optional flags:
 uv run python -m src.ask_buddy.feedback_report --cluster
 
 # Export negatively-rated questions as regression eval candidates:
-uv run python -m src.ask_buddy.feedback_report --export-evals tests/regression_evals.json
+uv run python -m src.ask_buddy.feedback_report --export-evals candidates.json
 ```
-After exporting, fill in `expected_sources` for questions that *should* be
-answerable, commit the file, and `TestFeedbackRegressionEvals` will assert
-retrieval keeps surfacing those sources so a future change can't silently regress.
+
+To turn those complaints into tests, curate them — this pulls pending cases
+from the database, offers the real corpus filenames to pick from, and writes
+`tests/regression_evals.json`:
+
+```bash
+uv run python -m src.ask_buddy.eval_curate          # interactive
+uv run python -m src.ask_buddy.eval_curate --list   # just show what's pending
+```
+
+Commit that file and `TestFeedbackRegressionEvals` will assert retrieval keeps
+surfacing those sources, so a future change can't silently regress. See
+"Regression evals from real feedback" in [README.md](README.md) for the full loop.
 
 ### Weekly digest to Slack (optional)
 
@@ -603,7 +613,11 @@ Schedule it with cron (Mondays 09:00 shown) — the bot itself does not schedule
 ## 12. Stopping and Restarting
 
 ### Stop the bot
-Press `Ctrl+C` in the terminal where the listener is running.
+Press `Ctrl+C` in the terminal where the listener is running. `Ctrl+C` and
+`SIGTERM` both shut down gracefully: schedulers stop, in-flight answers get up
+to `ASK_BUDDY_SHUTDOWN_WAIT` seconds (default 10) to finish delivering, and the
+Postgres pool is closed. Any GitHub confirmation still awaiting a click is
+cancelled — the user is told on next startup, and nothing runs on GitHub.
 
 ### Stop the database
 ```bash
@@ -713,9 +727,15 @@ uv run python -m src.ask_buddy.ingest --corpus it --clear # IT only
 
 ### Adding a new domain
 1. Create a directory under `data/` (e.g. `data/finance_docs/`)
-2. Ingest with a custom corpus tag: `uv run python -m src.ask_buddy.ingest --corpus finance --docs-dir data/finance_docs`
-3. Add a matching retrieval tool in `retrieve.py` and sub-agent in `agent.py`
-4. Register the sub-agent with the supervisor in `build_supervisor()`
+2. Add one `Corpus` entry to `src/ask_buddy/corpora.py`. The retrieval tool,
+   the sub-agent, its system prompt, the supervisor's routing bullet, and the
+   ingest default directory are all derived from it — no other file changes.
+3. Ingest: `uv run python -m src.ask_buddy.ingest --corpus finance`
+4. Restart the bot so the new agent is registered.
+
+Be generous with the entry's `topics`: that string becomes both the retrieval
+tool's description and the supervisor's routing hint, so it is what decides
+whether questions actually reach the new agent.
 
 Each file should have a header like:
 ```markdown
@@ -723,8 +743,10 @@ Each file should have a header like:
 **Effective Date:** YYYY-MM-DD
 ```
 
-The bot picks up new content immediately — no restart needed. Only
-new/changed files are processed; unchanged files are skipped.
+Re-ingesting an existing corpus needs no restart — retrieval sees new chunks
+immediately. Only new/changed files are processed; unchanged files are skipped.
+(Adding a whole new *corpus* does need a restart, since its agent is built at
+startup.)
 
 For non-Markdown documents (PDF, DOCX), convert them to Markdown first
 or extend `ingest.py` to use a parser like `pypdf` or `python-docx`.
@@ -766,6 +788,6 @@ AskBuddy/
 ├── .env.example                 Environment variable template
 ├── SLACK_PERMISSIONS.md         Slack app setup reference
 ├── pyproject.toml               Python dependencies
-├── README_ASKBUDDY.md           Architecture overview
+├── README.md                    Overview, architecture, usage
 └── INSTALLATION.md              ← this file
 ```

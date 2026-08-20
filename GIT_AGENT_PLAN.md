@@ -873,7 +873,7 @@ uv run pytest tests/test_ask_buddy.py -v -m "not integration"
 
 ## 9. Docs to update
 
-- **`README_ASKBUDDY.md`** — add a "Git Agent" section: what it answers
+- **`README.md`** — add a "Git Agent" section: what it answers
   (read-only issues/PRs), the two new slaves in the architecture diagram, the
   new env vars, and the triage behavior. Update the File Structure list to add
   `github_client.py` and `git_watch.py`.

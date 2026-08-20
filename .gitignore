@@ -10,5 +10,5 @@ wheels/
 # Virtual environments
 .venv
 
-# CUGA local policy/approval storage (per-environment, not shared)
+# CUGA local runtime state, if a local run creates any (per-environment)
 .cuga/
