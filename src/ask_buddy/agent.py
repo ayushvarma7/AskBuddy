@@ -1,24 +1,28 @@
 """
 Ask Buddy — CugaSupervisor with domain-specific sub-agents.
 
-The supervisor routes each query to the right sub-agent:
-  - hr_agent   — answers HR policy questions (PTO, benefits, leave, …)
-  - it_agent   — answers IT security questions (passwords, VPN, MFA, …)
+The supervisor routes each query to the right sub-agent. One document-domain
+agent is generated per entry in corpora.CORPORA (hr_agent, it_agent, …),
+alongside the scheduler and the two git agents.
 
-Each sub-agent has its own retrieval tool scoped to its corpus, plus a
-shared post_slack_message tool to deliver the final answer.
+Each domain sub-agent has its own retrieval tool scoped to its corpus, plus a
+shared post_slack_message tool to deliver the final answer. Adding a domain is
+a single entry in corpora.py — the tool, prompt, agent, and supervisor routing
+bullet are all derived from it.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
-from typing import Callable
+from typing import Any, Callable
 
 from cuga import CugaAgent, CugaSupervisor
 from dotenv import load_dotenv
 
-from .retrieve import hr_retrieve, it_retrieve, hybrid_retrieve
+from .corpora import CORPORA, Corpus, by_name, default_corpus
+from .retrieve import hybrid_retrieve, retrieve_tool_for
 from .db import get_github_login
 
 load_dotenv()
@@ -70,25 +74,33 @@ in the final Slack message.
 LATEST effective_date unless the user explicitly asks about a past version.
 """
 
-HR_SYSTEM_PROMPT = """\
-You are the HR Agent within Ask Buddy. You answer questions about \
-HR topics ONLY: time off, leave, benefits, expenses, performance \
-reviews, remote work, and workplace conduct. You have no other source \
-of information — no general knowledge, no internet access, no \
-assumptions beyond what is explicitly in the retrieved chunks.
+def domain_system_prompt(corpus: Corpus) -> str:
+    """
+    System prompt for one document-domain agent.
 
-Use hr_retrieve to search the HR document corpus.
-""" + _SHARED_RULES
+    Built from the corpus registry so a new domain gets the same guardrails —
+    the shared PROCESS/HARD RULES block — without anyone remembering to paste
+    them. `role` scopes the agent, and the "no other source of information"
+    clause is what keeps it from answering off general knowledge.
+    """
+    return (
+        f"You are the {corpus.label} Agent within Ask Buddy. You answer "
+        f"questions about {corpus.role}. You have no other source of "
+        f"information — no general knowledge, no internet access, no "
+        f"assumptions beyond what is explicitly in the retrieved chunks.\n\n"
+        f"Use {corpus.tool_name} to search the {corpus.label} document corpus.\n"
+    ) + _SHARED_RULES
 
-IT_SYSTEM_PROMPT = """\
-You are the IT Security Agent within Ask Buddy. You answer questions \
-about IT and information security topics ONLY: passwords, \
-authentication, MFA, VPN, remote access, device management, endpoint \
-security, data classification, data handling, and acceptable use of \
-company IT resources. You have no other source of information.
 
-Use it_retrieve to search the IT security document corpus.
-""" + _SHARED_RULES
+#: corpus name -> its system prompt
+DOMAIN_PROMPTS: dict[str, str] = {
+    corpus.name: domain_system_prompt(corpus) for corpus in CORPORA
+}
+
+# Named bindings for the original two, so tests and the prompt fingerprint can
+# reference them directly.
+HR_SYSTEM_PROMPT = DOMAIN_PROMPTS["hr"]
+IT_SYSTEM_PROMPT = DOMAIN_PROMPTS["it"]
 
 SCHEDULER_SYSTEM_PROMPT = """\
 You are the Scheduler Agent within Ask Buddy. You manage recurring \
@@ -208,19 +220,26 @@ guess or use their Slack display name as a GitHub login.
 - Deliver the final answer via post_slack_message.
 """
 
+def _domain_routing_bullets() -> str:
+    """One routing bullet per document corpus.
+
+    Generated rather than hand-written because a corpus the supervisor doesn't
+    know about is unreachable: the agent would exist and never be delegated to.
+    """
+    return "\n\n".join(
+        f"  • {c.agent_name} — handles {c.label} questions ({c.topics})."
+        for c in CORPORA
+    )
+
+
+#: Names of the document-domain agents, for the cross-domain routing rule.
+_DOMAIN_AGENT_NAMES = " and ".join(c.agent_name for c in CORPORA)
+
 SUPERVISOR_PROMPT = """\
 You are Ask Buddy, a workplace assistant for Acme Corp. You supervise \
 specialist agents:
 
-  • hr_agent — handles HR policy questions (PTO, vacation, sick leave, \
-parental leave, benefits, health insurance, 401k, expense \
-reimbursement, performance reviews, remote work, code of conduct, \
-workplace behaviour, hiring, onboarding, offboarding, compensation).
-
-  • it_agent — handles IT and security questions (passwords, MFA, VPN, \
-firewalls, network access, device management, endpoint security, data \
-classification, data handling, acceptable use, software licensing, \
-encryption, helpdesk).
+""" + _domain_routing_bullets() + """
 
   • scheduler_agent — creates, lists, and cancels recurring broadcast \
 reminders posted to Slack channels (e.g. "remind #channel to do X every \
@@ -236,10 +255,10 @@ merge/close with confirmation) for a given 'owner/repo'.
 
 When a user asks a question or gives a command:
 1. Determine which agent it belongs to and delegate to it.
-2. If a question spans both hr_agent and it_agent, delegate to each and \
-combine their answers.
+2. If a question spans more than one document domain (""" + _DOMAIN_AGENT_NAMES + """), \
+delegate to each and combine their answers.
 3. Requests to create/list/cancel a reminder always go to scheduler_agent, \
-never to hr_agent or it_agent.
+never to a document-domain agent.
 4. If the request is clearly outside all three domains (e.g. personal \
 advice, general trivia), respond directly with:
    No results found in our documents for that question — please \
@@ -306,17 +325,44 @@ def _fewshot_block() -> str:
 # Agent config tracking (for A/B feedback comparison)
 # ---------------------------------------------------------------------------
 
+def prompt_fingerprint() -> str:
+    """
+    Short stable hash of every system prompt the bot ships with.
+
+    Without this, "negative rate by agent config" can't tell a prompt edit
+    from a model swap — both look like the same config. Editing any prompt
+    below changes the fingerprint, so the report splits the two cleanly.
+
+    Covers the supervisor and all five sub-agent prompts, plus the shared
+    rules block they compose in. Deliberately excludes the few-shot and
+    default-repo blocks, which vary per environment and per database state
+    rather than per code change.
+    """
+    joined = "\u0000".join([
+        _SHARED_RULES,
+        HR_SYSTEM_PROMPT,
+        IT_SYSTEM_PROMPT,
+        SCHEDULER_SYSTEM_PROMPT,
+        GIT_ISSUE_SYSTEM_PROMPT,
+        GIT_PR_SYSTEM_PROMPT,
+        SUPERVISOR_PROMPT,
+    ])
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:8]
+
+
 def current_agent_config() -> str:
+    """Identifier stored on every answer, so feedback can be sliced by what
+    actually produced it: provider config, model, and prompt revision."""
     setting = os.environ.get("AGENT_SETTING_CONFIG", "default")
     model = os.environ.get("MODEL_NAME", "default")
-    return f"{setting}:{model}"
+    return f"{setting}:{model}:p{prompt_fingerprint()}"
 
 
 # ---------------------------------------------------------------------------
 # Agent builders
 # ---------------------------------------------------------------------------
 
-def _build_post_tool(slack_post_fn: Callable[[str, str], None]):
+def _build_post_tool(slack_post_fn: Callable[[str, str], None]) -> Any:
     """Create the post_slack_message @tool closure."""
     from langchain_core.tools import tool
 
@@ -332,24 +378,36 @@ def _build_post_tool(slack_post_fn: Callable[[str, str], None]):
     return post_slack_message
 
 
+def build_domain_agent(corpus: Corpus,
+                       slack_post_fn: Callable[[str, str], None]) -> CugaAgent:
+    """
+    Build the sub-agent for one document corpus.
+
+    Tools are strictly [<corpus>_retrieve, post_slack_message] and
+    enable_knowledge is False, so the agent has no way to answer except from
+    its own corpus. Few-shot examples are only injected for the default corpus,
+    since get_positive_examples() is not corpus-aware and HR examples would
+    mislead another domain.
+    """
+    post_tool = _build_post_tool(slack_post_fn)
+    instructions = DOMAIN_PROMPTS[corpus.name]
+    if corpus.name == default_corpus().name:
+        instructions += _fewshot_block()
+    return CugaAgent(
+        tools=[retrieve_tool_for(corpus.name), post_tool],
+        enable_knowledge=False,
+        special_instructions=instructions,
+    )
+
+
 def build_hr_agent(slack_post_fn: Callable[[str, str], None]) -> CugaAgent:
     """Build the HR-domain sub-agent."""
-    post_tool = _build_post_tool(slack_post_fn)
-    return CugaAgent(
-        tools=[hr_retrieve, post_tool],
-        enable_knowledge=False,
-        special_instructions=HR_SYSTEM_PROMPT + _fewshot_block(),
-    )
+    return build_domain_agent(by_name("hr"), slack_post_fn)
 
 
 def build_it_agent(slack_post_fn: Callable[[str, str], None]) -> CugaAgent:
     """Build the IT-security-domain sub-agent."""
-    post_tool = _build_post_tool(slack_post_fn)
-    return CugaAgent(
-        tools=[it_retrieve, post_tool],
-        enable_knowledge=False,
-        special_instructions=IT_SYSTEM_PROMPT,
-    )
+    return build_domain_agent(by_name("it"), slack_post_fn)
 
 
 def _default_resolve_channel(channel: str) -> tuple[str, str]:
@@ -361,7 +419,7 @@ def _default_resolve_channel(channel: str) -> tuple[str, str]:
 def _build_reminder_tools(
     resolve_channel_fn: Callable[[str], tuple[str, str]],
     created_by: str | None,
-):
+) -> tuple[Any, Any, Any]:
     """
     Build the create_reminder / list_reminders / cancel_reminder @tools.
 
@@ -442,7 +500,7 @@ def _build_reminder_tools(
     return create_reminder, list_reminders, cancel_reminder
 
 
-def _build_git_issue_tools():
+def _build_git_issue_tools() -> tuple[Any, Any, Any]:
     from langchain_core.tools import tool
     from . import github_client as gh
 
@@ -476,7 +534,7 @@ def _build_git_issue_tools():
     return list_issues, get_issue, search_issues
 
 
-def _build_git_pr_tools():
+def _build_git_pr_tools() -> tuple[Any, ...]:
     from langchain_core.tools import tool
     from . import github_client as gh
 
@@ -534,7 +592,7 @@ def _build_git_pr_tools():
             get_pr_files, get_pr_merge_status)
 
 
-def _build_git_write_tools():
+def _build_git_write_tools() -> tuple[Any, ...]:
     """Low-risk write tools: comment, label/remove-label, assign/unassign,
     request review, create issue/PR.
     Not approval-gated — easily reversible, low blast radius."""
@@ -616,7 +674,7 @@ def _build_git_write_tools():
             create_issue, create_pull_request)
 
 
-def _build_git_dangerous_tools():
+def _build_git_dangerous_tools() -> tuple[Any, Any]:
     """High-risk write tools: close/reopen/merge.
     MUST be approval-gated via agent.policies.add_tool_approval."""
     from langchain_core.tools import tool
@@ -641,7 +699,7 @@ def _build_git_dangerous_tools():
     return set_issue_state, merge_pull_request
 
 
-def _build_git_identity_tools(slack_user_id: str | None):
+def _build_git_identity_tools(slack_user_id: str | None) -> tuple[Any]:
     from langchain_core.tools import tool
 
     @tool
@@ -763,23 +821,21 @@ def build_supervisor(
     The supervisor itself also has post_slack_message so it can deliver
     out-of-scope refusals or combined answers directly.
     """
-    hr = build_hr_agent(slack_post_fn)
-    it = build_it_agent(slack_post_fn)
-    scheduler = build_scheduler_agent(slack_post_fn, resolve_channel_fn, created_by)
-    git_issue = build_git_issue_agent(slack_post_fn, user_id=created_by)
-    git_pr = build_git_pr_agent(slack_post_fn, user_id=created_by)
+    # One sub-agent per registered corpus, so a new entry in corpora.CORPORA
+    # is routed to without touching this function.
+    agents: dict[str, CugaAgent] = {
+        corpus.agent_name: build_domain_agent(corpus, slack_post_fn)
+        for corpus in CORPORA
+    }
+    agents["scheduler_agent"] = build_scheduler_agent(
+        slack_post_fn, resolve_channel_fn, created_by)
+    agents["git_issue_agent"] = build_git_issue_agent(slack_post_fn, user_id=created_by)
+    agents["git_pr_agent"] = build_git_pr_agent(slack_post_fn, user_id=created_by)
 
-    supervisor = CugaSupervisor(
-        agents={
-            "hr_agent": hr,
-            "it_agent": it,
-            "scheduler_agent": scheduler,
-            "git_issue_agent": git_issue,
-            "git_pr_agent": git_pr,
-        },
+    return CugaSupervisor(
+        agents=agents,
         special_instructions=SUPERVISOR_PROMPT,
     )
-    return supervisor
 
 
 def build_agent(slack_post_fn: Callable[[str, str], None]) -> CugaAgent:

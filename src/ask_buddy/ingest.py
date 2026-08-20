@@ -25,12 +25,13 @@ import re
 import sys
 from datetime import date
 from pathlib import Path
-from typing import Iterator
 
 import psycopg2.extras
 from dotenv import load_dotenv
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from pydantic import SecretStr
 
+from .corpora import default_corpus, docs_dir_for, names as corpus_names
 from .db import (
     get_conn,
     init_schema,
@@ -47,9 +48,11 @@ load_dotenv()
 # Config
 # ---------------------------------------------------------------------------
 
-HR_DOCS_DIR = Path(__file__).resolve().parents[2] / "data" / "hr_docs" / "synthetic"
-IT_DOCS_DIR = Path(__file__).resolve().parents[2] / "data" / "it_docs"
-DOCS_DIR = HR_DOCS_DIR
+# Source directories come from the corpus registry, so a new domain needs no
+# edit here — only a new entry in corpora.py.
+HR_DOCS_DIR = docs_dir_for("hr")
+IT_DOCS_DIR = docs_dir_for("it")
+DOCS_DIR = default_corpus().docs_dir
 CHUNK_TOKENS_TARGET = 500          # rough token target per chunk
 CHUNK_OVERLAP_CHARS = 200          # character overlap between adjacent chunks
 EMBED_MODEL = "models/gemini-embedding-001"
@@ -63,7 +66,9 @@ def _embedder() -> GoogleGenerativeAIEmbeddings:
         raise RuntimeError("GOOGLE_API_KEY is not set.")
     return GoogleGenerativeAIEmbeddings(
         model=EMBED_MODEL,
-        google_api_key=key,
+        # 'api_key' is the field's declared alias, and it is typed
+        # SecretStr — so the key never lands in a repr or traceback.
+        api_key=SecretStr(key),
         output_dimensionality=768,     # truncate 3072→768; stays within pgvector index limit
     )
 
@@ -280,8 +285,12 @@ def main() -> None:
     parser.add_argument(
         "--corpus",
         type=str,
-        default="hr",
-        help="Corpus tag stored on each chunk (hr, it, …). Default: hr",
+        default=default_corpus().name,
+        help=(
+            "Corpus tag stored on each chunk. Registered: "
+            + ", ".join(corpus_names())
+            + f". Default: {default_corpus().name}"
+        ),
     )
     parser.add_argument(
         "--clear",
@@ -294,8 +303,12 @@ def main() -> None:
     )
     args = parser.parse_args()
     if args.docs_dir is None:
-        defaults = {"hr": HR_DOCS_DIR, "it": IT_DOCS_DIR}
-        args.docs_dir = defaults.get(args.corpus, HR_DOCS_DIR)
+        try:
+            args.docs_dir = docs_dir_for(args.corpus)
+        except KeyError as exc:
+            # An unregistered corpus used to silently ingest the HR directory
+            # under the wrong tag; say so instead.
+            parser.error(str(exc))
     ingest_docs(args.docs_dir, clear=args.clear, corpus=args.corpus)
 
 
