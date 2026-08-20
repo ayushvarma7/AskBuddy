@@ -146,18 +146,24 @@ def store_feedback_row(
     retrieved_chunk_ids: list[int] | None = None,
     is_refusal: bool = False,
     agent_config: str | None = None,
+    citation_status: str | None = None,
 ) -> None:
     """
     Insert a pending row into ask_buddy_feedback when the answer is posted.
     feedback/user_id/feedback_reason stay NULL until the user clicks a button.
+
+    citation_status is the verdict from citations.validate_citations() — it is
+    recorded at post time (not on click) so citation integrity is measurable
+    across every answer, including the ones nobody ever rates.
     """
     sql = """
         INSERT INTO ask_buddy_feedback
             (response_id, question, answer_text, sources_cited,
-             retrieved_chunk_ids, is_refusal, agent_config)
+             retrieved_chunk_ids, is_refusal, agent_config, citation_status)
         VALUES
             (%(response_id)s, %(question)s, %(answer_text)s, %(sources_cited)s,
-             %(retrieved_chunk_ids)s, %(is_refusal)s, %(agent_config)s)
+             %(retrieved_chunk_ids)s, %(is_refusal)s, %(agent_config)s,
+             %(citation_status)s)
         ON CONFLICT (response_id) DO NOTHING;
     """
     with get_conn() as conn:
@@ -171,6 +177,7 @@ def store_feedback_row(
                 "retrieved_chunk_ids": retrieved_chunk_ids or None,
                 "is_refusal": is_refusal,
                 "agent_config": agent_config,
+                "citation_status": citation_status,
             })
 
 

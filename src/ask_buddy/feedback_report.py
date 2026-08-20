@@ -10,6 +10,7 @@ Prints:
   - Overall % positive / % negative / % unrated
   - Refusal breakdown (and 👎 refusals = doc-gap candidates)
   - Negative-feedback reason breakdown
+  - Citation integrity (answers whose Source(s) line didn't resolve)
   - Content-review queue (chunks with repeated thumbs-down)
   - Most common negatively- / positively-rated questions
   - Negative rate by agent config (A/B)
@@ -26,18 +27,20 @@ import argparse
 import json
 import math
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 load_dotenv()
 
-from .db import get_conn, get_low_quality_chunks, get_negative_feedback_rows
+from .db import (get_conn, get_low_quality_chunks, get_negative_feedback_rows,
+                 get_citation_status_counts, get_bad_citation_rows)
 
 
 # ---------------------------------------------------------------------------
 # Report sections
 # ---------------------------------------------------------------------------
 
-def _print_summary(cur) -> None:
+def _print_summary(cur: Any) -> None:
     cur.execute("""
         SELECT
             COUNT(*)                                        AS total,
@@ -64,7 +67,7 @@ def _print_summary(cur) -> None:
     print()
 
 
-def _print_refusals(cur) -> None:
+def _print_refusals(cur: Any) -> None:
     """Refusals split out: a 👎 on a refusal means 'this should be answerable'."""
     cur.execute("""
         SELECT
@@ -100,7 +103,7 @@ def _print_refusals(cur) -> None:
     print()
 
 
-def _print_reasons(cur) -> None:
+def _print_reasons(cur: Any) -> None:
     cur.execute("""
         SELECT COALESCE(feedback_reason, '(no reason given)') AS reason,
                COUNT(*) AS hits
@@ -119,6 +122,49 @@ def _print_reasons(cur) -> None:
     print()
 
 
+def _print_citation_integrity() -> None:
+    """
+    Citation integrity: did every answer's Source(s) line resolve to metadata
+    that actually exists in the corpus?
+
+    'ok' and 'refusal' are healthy. Anything else is the anti-hallucination
+    guarantee failing, and each one is a concrete bug to chase — not a
+    sentiment score, a verifiable fact about what shipped.
+    """
+    counts = get_citation_status_counts()
+    print("  Citation integrity (verified at post time):")
+    if not counts:
+        print("    (no answers recorded yet)")
+        print()
+        return
+
+    total = sum(int(r["hits"]) for r in counts)
+    healthy = sum(int(r["hits"]) for r in counts
+                  if r["citation_status"] in ("ok", "refusal"))
+    unrecorded = sum(int(r["hits"]) for r in counts
+                     if r["citation_status"] == "unrecorded")
+    checked = total - unrecorded
+    for r in counts:
+        status = r["citation_status"]
+        icon = "✅" if status in ("ok", "refusal") else ("—" if status == "unrecorded" else "❌")
+        print(f"    {icon} {status:<18}: {r['hits']}")
+    if checked:
+        print(f"    → {healthy}/{checked} checked answer(s) fully verified "
+              f"({healthy / checked * 100:.1f}%)")
+    if unrecorded:
+        print(f"    → {unrecorded} answer(s) predate the check (or it could not run)")
+    print()
+
+    bad = get_bad_citation_rows(limit=5)
+    if bad:
+        print("  Most recent citation failures:")
+        for b in bad:
+            print(f"    [{b['citation_status']}] {b['question'][:60]!r}")
+            cited = " ".join((b["sources_cited"] or "(none)").split())[:80]
+            print(f"        cited: {cited}")
+        print()
+
+
 def _print_content_review_queue() -> None:
     chunks = get_low_quality_chunks(min_negative=3)
     print("  Content-review queue (chunks with 3+ 👎):")
@@ -133,7 +179,7 @@ def _print_content_review_queue() -> None:
     print()
 
 
-def _print_top_questions(cur) -> None:
+def _print_top_questions(cur: Any) -> None:
     cur.execute("""
         SELECT question, COUNT(*) AS hits
         FROM ask_buddy_feedback
@@ -169,7 +215,7 @@ def _print_top_questions(cur) -> None:
     print()
 
 
-def _print_config_ab(cur) -> None:
+def _print_config_ab(cur: Any) -> None:
     cur.execute("""
         SELECT COALESCE(agent_config, '(untagged)') AS config,
                COUNT(*) FILTER (WHERE feedback IS NOT NULL)      AS rated,
@@ -191,7 +237,7 @@ def _print_config_ab(cur) -> None:
     print()
 
 
-def _print_recent_unrated(cur) -> None:
+def _print_recent_unrated(cur: Any) -> None:
     cur.execute("""
         SELECT question, created_at
         FROM ask_buddy_feedback
@@ -299,6 +345,7 @@ def run_report(cluster: bool = False) -> None:
             _print_refusals(cur)
             _print_reasons(cur)
     # These open their own connections.
+    _print_citation_integrity()
     _print_content_review_queue()
     with get_conn() as conn:
         with conn.cursor() as cur:

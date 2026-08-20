@@ -24,11 +24,12 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from datetime import datetime
 
 from dotenv import load_dotenv
 load_dotenv()
 
-from .db import get_conn, get_low_quality_chunks, get_negative_feedback_rows
+from .db import get_conn, get_low_quality_chunks
 
 
 def _collect(days: int) -> dict:
@@ -86,7 +87,7 @@ def _collect(days: int) -> dict:
     }
 
 
-def _format_date_range(start, end) -> str:
+def _format_date_range(start: datetime, end: datetime) -> str:
     """e.g. 'Jul 3 – Jul 10, 2026' (or 'Jul 3 – 10, 2026' when same month)."""
     if start.year == end.year and start.month == end.month:
         return f"{start.strftime('%b %-d')}–{end.strftime('%-d, %Y')}"
@@ -101,12 +102,12 @@ def _format_blocks(d: dict, days: int) -> list[dict]:
     pct = (neg / rated * 100) if rated else 0
     date_range = _format_date_range(d["window_start"], d["window_end"])
 
-    def _lines(rows, empty):
+    def _lines(rows: list[dict], empty: str) -> str:
         if not rows:
             return f"_{empty}_"
         return "\n".join(f"• [{r['hits']}×] {r['question'][:120]}" for r in rows)
 
-    blocks = [
+    blocks: list[dict] = [
         {"type": "header",
          "text": {"type": "plain_text", "text": "📋 Ask Buddy — weekly feedback digest"}},
         {"type": "section",

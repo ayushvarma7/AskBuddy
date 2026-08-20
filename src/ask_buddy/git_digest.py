@@ -8,9 +8,12 @@ the digest always reflects the full current state:
 
   - Total open issues / closed issues
   - Open issues breakdown by label (top 5)
-  - Total open PRs / merged PRs (last 30 days)
-  - PRs waiting for review (no approvals yet)
+  - Total open PRs / closed-or-merged PRs
+  - PRs waiting for review (no reviewer requested yet)
   - Draft PRs
+
+Counts are taken from the most recent 100 items GitHub returns per state, with
+no date window — "closed" means closed at any point, not closed recently.
 
 Can also be triggered on-demand via the /askbuddy slash command:
   /askbuddy git digest
@@ -76,6 +79,9 @@ def build_digest(repo: str) -> str:
     """
     Fetch current repo state from GitHub and return a formatted Slack message.
     Raises GitHubError on any API failure.
+
+    Each count comes from at most 100 items per state (GitHub's page cap here),
+    and is not restricted to a date range.
     """
     open_issues   = gh.list_issues(repo, state="open",   limit=100)
     closed_issues = gh.list_issues(repo, state="closed", limit=100)

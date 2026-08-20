@@ -140,7 +140,7 @@ def _request(path: str, params: dict | None = None) -> Any:
                             path, resp.status_code, attempt + 1, _RETRY_ATTEMPTS)
                 time.sleep(_RETRY_BASE_SLEEP * (2 ** attempt))
                 continue
-            raise last_exc  # type: ignore[misc]
+            raise last_exc
         if resp.status_code >= 400:
             raise GitHubError(f"GitHub error {resp.status_code}: {resp.text[:200]}")
         return resp.json()
@@ -186,7 +186,7 @@ def _request_write(method: str, path: str, json_body: dict | None = None) -> Any
                             method, path, resp.status_code, attempt + 1, _RETRY_ATTEMPTS)
                 time.sleep(_RETRY_BASE_SLEEP * (2 ** attempt))
                 continue
-            raise last_exc  # type: ignore[misc]
+            raise last_exc
         if resp.status_code >= 400:
             raise GitHubError(f"GitHub error {resp.status_code}: {resp.text[:200]}")
         return resp.json() if resp.text else {}
@@ -207,7 +207,7 @@ def _trim_issue(it: dict) -> dict:
         "title": it["title"],
         "state": it["state"],
         "author": _trim_user(it.get("user")),
-        "labels": [l["name"] for l in it.get("labels", [])],
+        "labels": [lbl["name"] for lbl in it.get("labels", [])],
         "assignees": [_trim_user(a) for a in it.get("assignees", [])],
         "comments": it.get("comments", 0),
         "created_at": it.get("created_at"),
@@ -224,7 +224,7 @@ def _trim_pr(pr: dict) -> dict:
         "state": pr["state"],
         "draft": pr.get("draft", False),
         "author": _trim_user(pr.get("user")),
-        "labels": [l["name"] for l in pr.get("labels", [])],
+        "labels": [lbl["name"] for lbl in pr.get("labels", [])],
         "requested_reviewers": [_trim_user(r) for r in pr.get("requested_reviewers", [])],
         "base": (pr.get("base") or {}).get("ref"),
         "head": (pr.get("head") or {}).get("ref"),
@@ -305,7 +305,11 @@ def get_pr_checks(repo: str, number: int) -> dict:
         return {"total": 0, "success": 0, "failure": 0, "pending": 0, "runs": []}
     data = _request(f"/repos/{owner}/{name}/commits/{sha}/check-runs")
     runs = data.get("check_runs", [])
-    out = {"total": len(runs), "success": 0, "failure": 0, "pending": 0, "runs": []}
+    # Heterogeneous by design — three counters plus the run list — so the value
+    # type has to be Any for the counter arithmetic below to type-check.
+    out: dict[str, Any] = {
+        "total": len(runs), "success": 0, "failure": 0, "pending": 0, "runs": [],
+    }
     for r in runs:
         concl = r.get("conclusion")
         status = r.get("status")
@@ -430,7 +434,7 @@ def add_labels(repo: str, number: int, labels: list[str]) -> list[str]:
     owner, name = _split_repo(repo)
     data = _request_write("POST", f"/repos/{owner}/{name}/issues/{number}/labels",
                           {"labels": labels})
-    return [l["name"] for l in data]
+    return [lbl["name"] for lbl in data]
 
 
 def remove_label(repo: str, number: int, label: str) -> dict:
@@ -440,7 +444,7 @@ def remove_label(repo: str, number: int, label: str) -> dict:
     # GitHub returns the remaining labels after removal.
     data = _request_write("DELETE",
                           f"/repos/{owner}/{name}/issues/{number}/labels/{label}")
-    remaining = [l["name"] for l in data] if isinstance(data, list) else []
+    remaining = [lbl["name"] for lbl in data] if isinstance(data, list) else []
     return {"number": number, "labels_remaining": remaining}
 
 

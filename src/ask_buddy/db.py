@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
 from contextlib import contextmanager
+from typing import Any, Iterator
 
 
 # ---------------------------------------------------------------------------
@@ -19,6 +21,10 @@ from contextlib import contextmanager
 # is_refusal          : TRUE when the answer was the "No results found" message.
 # feedback_reason     : category chosen in the 👎 modal (wrong_info, no_source, …).
 # agent_config        : which LLM/agent config produced the answer (for A/B).
+# citation_status     : verdict from citations.validate_citations() — 'ok',
+#                       'refusal', 'missing_sources', 'unknown_file', or
+#                       'unknown_section'. Anything but the first two means a
+#                       citation did not resolve to real corpus metadata.
 _FEEDBACK_TABLE_DDL = """
     CREATE TABLE IF NOT EXISTS ask_buddy_feedback (
         id                  SERIAL PRIMARY KEY,
@@ -32,6 +38,7 @@ _FEEDBACK_TABLE_DDL = """
         is_refusal          BOOLEAN     NOT NULL DEFAULT FALSE,
         feedback_reason     TEXT,
         agent_config        TEXT,
+        citation_status     TEXT,
         created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
     );
 
@@ -40,7 +47,8 @@ _FEEDBACK_TABLE_DDL = """
         ADD COLUMN IF NOT EXISTS retrieved_chunk_ids INTEGER[],
         ADD COLUMN IF NOT EXISTS is_refusal          BOOLEAN NOT NULL DEFAULT FALSE,
         ADD COLUMN IF NOT EXISTS feedback_reason     TEXT,
-        ADD COLUMN IF NOT EXISTS agent_config        TEXT;
+        ADD COLUMN IF NOT EXISTS agent_config        TEXT,
+        ADD COLUMN IF NOT EXISTS citation_status     TEXT;
 
     CREATE INDEX IF NOT EXISTS ask_buddy_feedback_response_idx
         ON ask_buddy_feedback (response_id);
@@ -48,6 +56,8 @@ _FEEDBACK_TABLE_DDL = """
         ON ask_buddy_feedback (feedback);
     CREATE INDEX IF NOT EXISTS ask_buddy_feedback_refusal_idx
         ON ask_buddy_feedback (is_refusal);
+    CREATE INDEX IF NOT EXISTS ask_buddy_feedback_citation_idx
+        ON ask_buddy_feedback (citation_status);
 """
 
 
@@ -107,6 +117,47 @@ _GIT_IDENTITIES_TABLE_DDL = """
 """
 
 
+# ---------------------------------------------------------------------------
+# Pending write-action approvals (audit trail + restart detection)
+# ---------------------------------------------------------------------------
+#
+# A gated GitHub action (merge / close / reopen) pauses the CugaSupervisor's
+# graph, which lives in an in-memory checkpointer — so the *resume handle*
+# cannot survive a restart no matter what we store. What this table gives us:
+#
+#   1. an audit trail of every high-risk action that was ever proposed, who
+#      resolved it, and how;
+#   2. the ability to notice, at startup, that a confirmation was left hanging
+#      and tell the user plainly instead of leaving buttons that only report a
+#      vague "expired or already handled" when clicked.
+#
+# outcome: confirmed | cancelled | expired | orphaned
+#   orphaned = the bot restarted while this was awaiting a click. Nothing ran
+#   on GitHub; the user has to ask again.
+_PENDING_APPROVALS_TABLE_DDL = """
+    CREATE TABLE IF NOT EXISTS ask_buddy_pending_approvals (
+        id            SERIAL      PRIMARY KEY,
+        thread_id     TEXT        NOT NULL,
+        channel       TEXT        NOT NULL,
+        thread_ts     TEXT,
+        user_id       TEXT,
+        user_text     TEXT        NOT NULL,
+        agent_config  TEXT,
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+        resolved_at   TIMESTAMPTZ,
+        resolved_by   TEXT,
+        outcome       TEXT        CHECK (outcome IN
+                          ('confirmed','cancelled','expired','orphaned'))
+    );
+
+    -- At most one unresolved approval per thread, mirroring the in-memory
+    -- no-clobber rule in slack_listener._stash_pending_approval.
+    CREATE UNIQUE INDEX IF NOT EXISTS ask_buddy_pending_approvals_open_idx
+        ON ask_buddy_pending_approvals (thread_id)
+        WHERE resolved_at IS NULL;
+"""
+
+
 def _dsn() -> str:
     dsn = os.environ.get("ASK_BUDDY_DB_DSN")
     if not dsn:
@@ -142,8 +193,26 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
     return _pool
 
 
+def close_pool() -> None:
+    """
+    Close every pooled connection and reset the pool.
+
+    Registered as a shutdown hook so a stopping bot releases its Postgres
+    connections instead of leaving the server to time them out. Safe to call
+    when no pool was ever opened.
+    """
+    global _pool
+    with _pool_lock:
+        if _pool is None:
+            return
+        try:
+            _pool.closeall()
+        finally:
+            _pool = None
+
+
 @contextmanager
-def get_conn():
+def get_conn() -> Iterator[Any]:
     """Yield a pooled psycopg2 connection with autocommit disabled.
     Returns the connection to the pool on exit (commit on success,
     rollback on exception)."""
@@ -172,6 +241,9 @@ def init_schema() -> None:
         embedding        vector(768),
         effective_date   DATE,
         corpus           TEXT        NOT NULL DEFAULT 'hr',
+        -- Named for an earlier BM25 design; keyword ranking is actually
+        -- Postgres ts_rank_cd over this tsvector (see retrieve._keyword_search).
+        -- Kept as-is because renaming it would require a data migration.
         bm25_tsvector    tsvector
             GENERATED ALWAYS AS (to_tsvector('english', chunk_text)) STORED
     );
@@ -224,6 +296,8 @@ def init_schema() -> None:
     """ + _GIT_WATCH_TABLE_DDL + """
     -- Slack user -> GitHub login identity mapping
     """ + _GIT_IDENTITIES_TABLE_DDL + """
+    -- Audit trail for gated GitHub write actions
+    """ + _PENDING_APPROVALS_TABLE_DDL + """
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -261,6 +335,104 @@ def get_github_login(slack_user_id: str) -> str | None:
             )
             row = cur.fetchone()
             return row["github_login"] if row else None
+
+
+def init_pending_approvals_schema() -> None:
+    """Idempotent: create just the pending-approvals table. Safe at startup."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(_PENDING_APPROVALS_TABLE_DDL)
+
+
+def insert_pending_approval(thread_id: str, channel: str, user_text: str,
+                            user_id: str | None = None,
+                            thread_ts: str | None = None,
+                            agent_config: str | None = None) -> int | None:
+    """
+    Record that a high-risk action is awaiting confirmation.
+
+    Returns the row id, or None if this thread already has an unresolved
+    approval (the partial unique index rejects the second one). None is not an
+    error: the caller has already decided to keep the first request.
+    """
+    sql = """
+        INSERT INTO ask_buddy_pending_approvals
+            (thread_id, channel, thread_ts, user_id, user_text, agent_config)
+        VALUES (%(thread_id)s, %(channel)s, %(thread_ts)s, %(user_id)s,
+                %(user_text)s, %(agent_config)s)
+        ON CONFLICT DO NOTHING
+        RETURNING id;
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, {
+                "thread_id": thread_id,
+                "channel": channel,
+                "thread_ts": thread_ts,
+                "user_id": user_id,
+                "user_text": user_text,
+                "agent_config": agent_config,
+            })
+            row = cur.fetchone()
+            return int(row["id"]) if row else None
+
+
+def resolve_pending_approval(thread_id: str, outcome: str,
+                             resolved_by: str | None = None) -> bool:
+    """
+    Close out the unresolved approval for a thread. True if a row was updated.
+
+    Only touches unresolved rows, so a double-click can't rewrite history.
+    """
+    sql = """
+        UPDATE ask_buddy_pending_approvals
+           SET resolved_at = now(),
+               resolved_by = %(resolved_by)s,
+               outcome     = %(outcome)s
+         WHERE thread_id = %(thread_id)s
+           AND resolved_at IS NULL;
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, {"thread_id": thread_id, "outcome": outcome,
+                              "resolved_by": resolved_by})
+            return cur.rowcount > 0
+
+
+def get_unresolved_approvals() -> list[dict]:
+    """
+    Approvals still awaiting a click. Called at startup: anything here was
+    left hanging by the previous process.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, thread_id, channel, thread_ts, user_id, user_text, "
+                "created_at FROM ask_buddy_pending_approvals "
+                "WHERE resolved_at IS NULL ORDER BY id;"
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+def orphan_unresolved_approvals() -> list[dict]:
+    """
+    Mark every unresolved approval as orphaned and return the rows.
+
+    Run once at startup. The returned rows are what the listener needs in order
+    to tell each affected channel that its pending confirmation is void and
+    nothing was changed on GitHub.
+    """
+    rows = get_unresolved_approvals()
+    if not rows:
+        return []
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE ask_buddy_pending_approvals "
+                "SET resolved_at = now(), outcome = 'orphaned' "
+                "WHERE resolved_at IS NULL;"
+            )
+    return rows
 
 
 def init_reminders_schema() -> None:
@@ -371,7 +543,16 @@ def init_feedback_schema() -> None:
             cur.execute(_FEEDBACK_TABLE_DDL)
 
 
-def get_chunk_quality() -> dict[int, dict[str, int]]:
+# Chunk-quality tallies are read on every retrieval but only change when
+# someone clicks a feedback button, so the aggregate is cached briefly rather
+# than re-scanning ask_buddy_feedback per query.
+
+_CHUNK_QUALITY_TTL_SECONDS = 60
+_chunk_quality_cache: tuple[float, dict[int, dict[str, int]]] | None = None
+_chunk_quality_lock = threading.Lock()
+
+
+def get_chunk_quality(force_refresh: bool = False) -> dict[int, dict[str, int]]:
     """
     Return per-chunk feedback tallies keyed by hr_chunks.id:
 
@@ -381,7 +562,20 @@ def get_chunk_quality() -> dict[int, dict[str, int]]:
     (a chunk can appear in many answers). Used to bias retrieval ranking and
     to surface low-quality source text for human review. Refusals are ignored
     since they cite no chunks.
+
+    Cached for _CHUNK_QUALITY_TTL_SECONDS: this runs a full aggregate over
+    ask_buddy_feedback, and a vote landing up to a minute later than it could
+    have is a fair trade for not paying that scan on every single query. Pass
+    force_refresh=True to bypass the cache.
     """
+    global _chunk_quality_cache
+    now = time.monotonic()
+
+    if not force_refresh and _chunk_quality_cache is not None:
+        cached_at, tallies = _chunk_quality_cache
+        if now - cached_at < _CHUNK_QUALITY_TTL_SECONDS:
+            return tallies
+
     sql = """
         SELECT chunk_id,
                COUNT(*) FILTER (WHERE feedback = 'positive') AS positive,
@@ -404,7 +598,98 @@ def get_chunk_quality() -> dict[int, dict[str, int]]:
                     "negative": neg,
                     "net": pos - neg,
                 }
+
+    with _chunk_quality_lock:
+        _chunk_quality_cache = (now, quality)
     return quality
+
+
+# ---------------------------------------------------------------------------
+# Known source metadata (for citation validation)
+# ---------------------------------------------------------------------------
+#
+# Cached with a short TTL: this is read once per posted answer, but the
+# underlying set only changes when someone re-runs the ingest pipeline, so
+# re-querying on every message would be wasted work.
+
+_KNOWN_SOURCES_TTL_SECONDS = 300
+_known_sources_cache: tuple[float, set[tuple[str, str]]] | None = None
+_known_sources_lock = threading.Lock()
+
+
+def get_known_sources(force_refresh: bool = False) -> set[tuple[str, str]]:
+    """
+    Return every (source_filename, section) pair present in the corpus.
+
+    Used by citations.validate_citations() to tell a real citation from a
+    fabricated one. Spans all corpora deliberately — an answer citing an IT
+    document is still citing a document that exists.
+    """
+    global _known_sources_cache
+    now = time.monotonic()
+
+    if not force_refresh and _known_sources_cache is not None:
+        cached_at, pairs = _known_sources_cache
+        if now - cached_at < _KNOWN_SOURCES_TTL_SECONDS:
+            return pairs
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT source_filename, section FROM hr_chunks;")
+            pairs = {(r["source_filename"], r["section"] or "") for r in cur.fetchall()}
+
+    with _known_sources_lock:
+        _known_sources_cache = (now, pairs)
+    return pairs
+
+
+def get_source_corpora() -> dict[str, str]:
+    """
+    Map each source filename to the corpus it was ingested under.
+
+    Used by the eval curation tool so a curated case records which retrieval
+    tool should be able to find its expected source — an IT document is never
+    reachable through hr_retrieve.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT source_filename, corpus FROM hr_chunks;")
+            return {r["source_filename"]: r["corpus"] for r in cur.fetchall()}
+
+
+def get_citation_status_counts() -> list[dict]:
+    """Return {citation_status, hits} across all stored answers, worst first.
+    Used by the feedback report's citation-integrity section."""
+    sql = """
+        SELECT COALESCE(citation_status, 'unrecorded') AS citation_status,
+               COUNT(*) AS hits
+        FROM ask_buddy_feedback
+        GROUP BY 1
+        ORDER BY hits DESC, citation_status;
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            return [dict(r) for r in cur.fetchall()]
+
+
+def get_bad_citation_rows(limit: int = 10) -> list[dict]:
+    """
+    Return recent answers whose citations did not resolve to real corpus
+    metadata — the concrete evidence behind the citation-integrity counts.
+    """
+    sql = """
+        SELECT question, answer_text, sources_cited, citation_status, created_at
+        FROM ask_buddy_feedback
+        WHERE citation_status IS NOT NULL
+          AND citation_status NOT IN ('ok', 'refusal')
+        ORDER BY created_at DESC
+        LIMIT %(limit)s;
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, {"limit": limit})
+            return [dict(r) for r in cur.fetchall()]
 
 
 def get_low_quality_chunks(min_negative: int = 3) -> list[dict]:
