@@ -18,6 +18,14 @@
   .legend { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 20px; font-size: 12px; color: #57606a; }
   .legend-item { display: flex; align-items: center; gap: 6px; }
   .swatch { width: 14px; height: 14px; border-radius: 3px; flex-shrink: 0; }
+  h2 { font-size: 15px; font-weight: 600; margin: 40px 0 4px; padding-top: 20px;
+       border-top: 1px solid #e5e7eb; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; margin-top: 12px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #e5e7eb;
+           vertical-align: top; }
+  th { color: #57606a; font-weight: 600; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
+         background: #f6f8fa; padding: 1px 4px; border-radius: 3px; }
   footer {
     margin-top: 40px;
     padding-top: 12px;
@@ -209,6 +217,120 @@
     <div class="legend-item"><div class="swatch" style="background:#ca8a04;"></div> Scheduler / digest</div>
     <div class="legend-item"><div class="swatch" style="background:#57606a;"></div> Feedback / misc</div>
   </div>
+
+
+  <h2>Cross-cutting concerns</h2>
+  <p class="sub">Everything above describes one request. These four apply to all of them.</p>
+
+  <svg viewBox="0 0 720 300" xmlns="http://www.w3.org/2000/svg" aria-label="Cross-cutting concerns diagram">
+    <!-- Own marker defs: referencing the first diagram's <defs> across two
+         separate <svg> roots is browser-dependent, so arrows are defined here. -->
+    <defs>
+      <marker id="x-arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L0,6 L8,3 z" fill="#3b82d4"/>
+      </marker>
+      <marker id="x-arr-green" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L0,6 L8,3 z" fill="#16a34a"/>
+      </marker>
+      <marker id="x-arr-purple" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L0,6 L8,3 z" fill="#7c5cd8"/>
+      </marker>
+    </defs>
+
+    <!-- inbound gate -->
+    <rect x="10" y="14" width="150" height="58" rx="6" fill="#e0f0ff" stroke="#3b82d4" stroke-width="1.5"/>
+    <text x="85" y="34" text-anchor="middle" font-size="11" font-weight="600" fill="#1f2328">Inbound event</text>
+    <text x="85" y="49" text-anchor="middle" font-size="10" fill="#57606a">DM · mention · slash</text>
+    <text x="85" y="63" text-anchor="middle" font-size="10" fill="#57606a">request_id assigned</text>
+
+    <line x1="160" y1="43" x2="205" y2="43" stroke="#3b82d4" stroke-width="1.5" marker-end="url(#x-arr)"/>
+
+    <rect x="205" y="14" width="150" height="58" rx="6" fill="#fff7e6" stroke="#d97706" stroke-width="1.5"/>
+    <text x="280" y="34" text-anchor="middle" font-size="11" font-weight="600" fill="#1f2328">Rate limiter</text>
+    <text x="280" y="49" text-anchor="middle" font-size="10" fill="#57606a">per-user window</text>
+    <text x="280" y="63" text-anchor="middle" font-size="10" fill="#57606a">+ daily UTC cap</text>
+
+    <line x1="355" y1="43" x2="400" y2="43" stroke="#3b82d4" stroke-width="1.5" marker-end="url(#x-arr)"/>
+
+    <rect x="400" y="14" width="150" height="58" rx="6" fill="#f7f8fa" stroke="#e5e7eb" stroke-width="1.5"/>
+    <text x="475" y="34" text-anchor="middle" font-size="11" font-weight="600" fill="#1f2328">Worker thread</text>
+    <text x="475" y="49" text-anchor="middle" font-size="10" fill="#57606a">tracked for drain</text>
+    <text x="475" y="63" text-anchor="middle" font-size="10" fill="#57606a">request_id re-bound</text>
+
+    <line x1="550" y1="43" x2="595" y2="43" stroke="#3b82d4" stroke-width="1.5" marker-end="url(#x-arr)"/>
+
+    <rect x="595" y="14" width="115" height="58" rx="6" fill="#e0f0ff" stroke="#3b82d4" stroke-width="1.5"/>
+    <text x="652" y="40" text-anchor="middle" font-size="11" font-weight="600" fill="#1f2328">Supervisor</text>
+    <text x="652" y="55" text-anchor="middle" font-size="10" fill="#57606a">(see above)</text>
+
+    <!-- answer path: citation gate -->
+    <line x1="652" y1="72" x2="652" y2="106" stroke="#3b82d4" stroke-width="1.5" marker-end="url(#x-arr)"/>
+    <rect x="470" y="106" width="240" height="62" rx="6" fill="#eaf7ee" stroke="#16a34a" stroke-width="1.5"/>
+    <text x="590" y="126" text-anchor="middle" font-size="11" font-weight="600" fill="#1f2328">Citation validator</text>
+    <text x="590" y="141" text-anchor="middle" font-size="10" fill="#57606a">Source(s) checked vs corpus metadata</text>
+    <text x="590" y="155" text-anchor="middle" font-size="10" fill="#57606a">verdict stored · never blocks the answer</text>
+
+    <line x1="470" y1="137" x2="415" y2="137" stroke="#7c5cd8" stroke-width="1.5" marker-end="url(#x-arr-purple)"/>
+    <rect x="245" y="118" width="170" height="38" rx="4" fill="#f5f0ff" stroke="#7c5cd8" stroke-width="1"/>
+    <text x="330" y="133" text-anchor="middle" font-size="10" font-weight="600" fill="#5b21b6">ask_buddy_feedback</text>
+    <text x="330" y="147" text-anchor="middle" font-size="10" fill="#5b21b6">+ citation_status</text>
+
+    <!-- eval loop -->
+    <line x1="330" y1="156" x2="330" y2="190" stroke="#16a34a" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#x-arr-green)"/>
+    <rect x="180" y="190" width="300" height="42" rx="5" fill="#eaf7ee" stroke="#16a34a" stroke-width="1.5"/>
+    <text x="330" y="208" text-anchor="middle" font-size="11" font-weight="600" fill="#1f2328">eval_curate → regression_evals.json</text>
+    <text x="330" y="222" text-anchor="middle" font-size="10" fill="#57606a">a 👎 becomes a committed retrieval test</text>
+
+    <!-- lifecycle -->
+    <rect x="10" y="190" width="150" height="80" rx="6" fill="#fffbea" stroke="#ca8a04" stroke-width="1.5"/>
+    <text x="85" y="209" text-anchor="middle" font-size="11" font-weight="600" fill="#1f2328">Service registry</text>
+    <text x="85" y="224" text-anchor="middle" font-size="10" fill="#57606a">running / disabled</text>
+    <text x="85" y="237" text-anchor="middle" font-size="10" fill="#57606a">/ failed per service</text>
+    <text x="85" y="255" text-anchor="middle" font-size="10" fill="#57606a">SIGTERM → drain,</text>
+    <text x="85" y="266" text-anchor="middle" font-size="10" fill="#57606a">stop, close pool</text>
+
+    <!-- corpus registry -->
+    <rect x="500" y="190" width="210" height="80" rx="6" fill="#f5f0ff" stroke="#7c5cd8" stroke-width="1.5"/>
+    <text x="605" y="209" text-anchor="middle" font-size="11" font-weight="600" fill="#1f2328">Corpus registry</text>
+    <text x="605" y="225" text-anchor="middle" font-size="10" fill="#5b21b6">one entry per document domain</text>
+    <text x="605" y="240" text-anchor="middle" font-size="10" fill="#57606a">derives: retrieval tool, prompt,</text>
+    <text x="605" y="253" text-anchor="middle" font-size="10" fill="#57606a">sub-agent, supervisor routing,</text>
+    <text x="605" y="266" text-anchor="middle" font-size="10" fill="#57606a">ingest directory</text>
+  </svg>
+
+  <h2>Module inventory</h2>
+  <table>
+    <tr><th>Module</th><th>Responsibility</th></tr>
+    <tr><td><code>slack_listener.py</code></td><td>Socket Mode entry point; event handlers, approval buttons, startup wiring</td></tr>
+    <tr><td><code>agent.py</code></td><td>CugaSupervisor and every sub-agent; prompts; tool factories by risk tier</td></tr>
+    <tr><td><code>corpora.py</code></td><td>Corpus registry — the single definition of a document domain</td></tr>
+    <tr><td><code>retrieve.py</code></td><td>Corpus-scoped hybrid retrieval: pgvector + full-text, merged by RRF, re-weighted by feedback</td></tr>
+    <tr><td><code>citations.py</code></td><td>Deterministic <code>Source(s)</code> validation against real corpus metadata</td></tr>
+    <tr><td><code>eval_curate.py</code></td><td>Turns negative feedback into committed regression tests</td></tr>
+    <tr><td><code>ratelimit.py</code></td><td>Per-user throttle and daily request ceiling</td></tr>
+    <tr><td><code>lifecycle.py</code></td><td>Background-service health registry and graceful shutdown</td></tr>
+    <tr><td><code>logging_setup.py</code></td><td>Correlation IDs and text/JSON log formatting</td></tr>
+    <tr><td><code>db.py</code></td><td>Connection pool, idempotent DDL, every query helper</td></tr>
+    <tr><td><code>ingest.py</code></td><td>Chunking, embedding, incremental corpus ingestion</td></tr>
+    <tr><td><code>scheduler.py</code></td><td>Recurring reminders on a persistent Postgres job store</td></tr>
+    <tr><td><code>github_client.py</code></td><td>GitHub REST client with retry, rate-limit guard, write audit logging</td></tr>
+    <tr><td><code>git_watch.py</code> / <code>git_digest.py</code></td><td>Proactive triage polling and scheduled repo digests</td></tr>
+    <tr><td><code>feedback.py</code></td><td>Block Kit feedback UI and persistence</td></tr>
+    <tr><td><code>feedback_report.py</code> / <code>feedback_digest.py</code></td><td>Analytics CLI and weekly Slack digest</td></tr>
+  </table>
+
+  <h2>Storage</h2>
+  <table>
+    <tr><th>Table</th><th>Holds</th></tr>
+    <tr><td><code>hr_chunks</code></td><td>Every corpus's chunks, discriminated by <code>corpus</code>; embedding, tsvector, effective date</td></tr>
+    <tr><td><code>hr_ingested_files</code></td><td>Per-file content hash, so re-ingest skips unchanged documents</td></tr>
+    <tr><td><code>ask_buddy_feedback</code></td><td>One row per posted answer: question, answer, sources, rating, citation verdict, agent config</td></tr>
+    <tr><td><code>ask_buddy_reminders</code></td><td>Active recurring reminders (cron + timezone)</td></tr>
+    <tr><td><code>ask_buddy_scheduler_jobs</code></td><td>APScheduler's own job state, so missed reminders survive a restart</td></tr>
+    <tr><td><code>ask_buddy_git_watch</code></td><td>Per-repo high-water marks for triage dedup</td></tr>
+    <tr><td><code>ask_buddy_git_identities</code></td><td>Slack user → GitHub login</td></tr>
+    <tr><td><code>ask_buddy_pending_approvals</code></td><td>Audit trail of every high-risk GitHub action proposed and how it resolved</td></tr>
+  </table>
 
   <footer>Made with IBM Bob</footer>
 </div>

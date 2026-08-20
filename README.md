@@ -40,7 +40,9 @@ Cross-domain questions (e.g. something touching both HR policy and IT security) 
 
 ## Architecture
 
-> A proper diagram with swimlanes is being added in the next iteration. This section will show the full request path from Slack message to Postgres/GitHub and back, the background scheduler jobs, and the feedback loop. For now, the text description below covers the same ground.
+> A full interactive diagram — request path, background jobs, and the feedback
+> loop — is in [`docs/architecture.html`](docs/architecture.html); open it in a
+> browser. The text below covers the same ground.
 
 **Request path:**
 1. A message arrives via Slack Bolt (Socket Mode — no public URL needed)
@@ -178,12 +180,36 @@ Startup log should show:
 ask_buddy_feedback table ready.
 ask_buddy_reminders table ready.
 ask_buddy_git_watch table ready.
-Reminder scheduler started.
-[git_watch] started: repos=[...] channel=... every 5 min   ← only if GIT_WATCH_REPOS is set
-[git_digest] started ...                                    ← only if GIT_WATCH_REPOS is set
+ask_buddy_pending_approvals table ready.
+[lifecycle] reminder_scheduler running
+[lifecycle] git_triage_watcher disabled by configuration   ← unless GIT_WATCH_REPOS is set
+[lifecycle] git_daily_digest disabled by configuration     ← unless GIT_WATCH_REPOS is set
+[lifecycle] approval_sweep running
 Starting Ask Buddy in Socket Mode…
 ⚡️ Bolt app is running!
 ```
+
+Each background service reports `running`, `disabled by configuration`, or
+`failed` — and `/askbuddy status` shows the same thing at any time, so a service
+that died isn't invisible.
+
+**Or run it in Docker** — the compose file includes the bot alongside Postgres:
+
+```bash
+docker compose -f docker-compose.askbuddy.yml up -d --build
+```
+
+That reads your `.env`, points the bot at the `postgres` service, switches
+logging to JSON, and allows 20s on stop for in-flight answers to finish. You
+still need to run the ingest step above once against the database.
+
+### Stopping cleanly
+
+SIGTERM (or Ctrl-C) triggers a graceful shutdown: schedulers stop, in-flight
+answers get up to `ASK_BUDDY_SHUTDOWN_WAIT` seconds to finish delivering, and
+the Postgres pool is closed. Any GitHub confirmation still awaiting a click is
+marked orphaned, and the user is told it was cancelled on next startup —
+nothing runs on GitHub without a live click.
 
 ---
 
@@ -327,7 +353,7 @@ Run the feedback report:
 uv run python -m src.ask_buddy.feedback_report
 ```
 
-Output includes total/positive/negative/unrated counts, top negatively-rated questions, and low-quality chunk detection (chunks that have been 👎'd across multiple answers). The report also exports a `regression_evals.json` template that you can annotate with expected sources — those become automated retrieval regression tests.
+Output includes total/positive/negative/unrated counts, top negatively-rated questions, low-quality chunk detection (chunks that have been 👎'd across multiple answers), and citation integrity (see below).
 
 Run the weekly digest to a Slack channel:
 
@@ -336,6 +362,110 @@ uv run python -m src.ask_buddy.feedback_digest
 ```
 
 Set `ASK_BUDDY_DIGEST_CHANNEL` in `.env` to a channel ID (not name) to make this work.
+
+---
+
+## Citation integrity
+
+Every agent prompt forbids fabricating a filename, section, or date. That rule
+is now **verified rather than trusted**: before each answer is posted, its
+`Source(s):` block is parsed and every citation is checked against the source
+metadata that actually exists in the corpus. The verdict is stored on the
+answer's row in `ask_buddy_feedback.citation_status`:
+
+| Verdict | Meaning |
+|---|---|
+| `ok` | Every citation resolves to real corpus metadata |
+| `refusal` | A "No results found" answer — cites nothing by design |
+| `missing_sources` | A non-refusal answer shipped with no `Source(s):` line |
+| `unknown_file` | A cited document does not exist — the model invented it |
+| `unknown_section` | The document exists but the cited heading does not |
+
+The check never blocks a message — an answer the user is waiting on still gets
+delivered — but a failure is logged at WARNING level and counted in the report:
+
+```
+  Citation integrity (verified at post time):
+    ✅ ok                : 128
+    ✅ refusal           : 14
+    ❌ unknown_section   : 2
+    → 142/144 checked answer(s) fully verified (98.6%)
+```
+
+Because the verdict is recorded at post time, it covers **every** answer —
+including the ones nobody ever rates. Section comparison tolerates a
+dropped or added heading number (`2. PTO Accrual Rates` vs `PTO Accrual
+Rates`); an invented heading shares no text with a real one and is still
+caught.
+
+---
+
+## Regression evals from real feedback
+
+A 👎 in Slack can become a permanent test. The loop:
+
+```
+user 👎s an answer   →   ask_buddy_feedback
+        ↓
+eval_curate           →   a human says which document should have answered
+        ↓
+tests/regression_evals.json  (committed)
+        ↓
+pytest                →   retrieval must keep surfacing that source
+```
+
+Curate interactively — it pulls pending cases straight from the database and
+offers the real corpus filenames to choose from, so you pick a document that
+exists instead of typing one from memory:
+
+```bash
+uv run python -m src.ask_buddy.eval_curate
+```
+
+See what's waiting, without changing anything:
+
+```bash
+uv run python -m src.ask_buddy.eval_curate --list
+```
+
+Annotate or dismiss one case non-interactively:
+
+```bash
+uv run python -m src.ask_buddy.eval_curate --set "how much PTO after 5 years?" --sources pto_policy.md
+uv run python -m src.ask_buddy.eval_curate --skip "some question not worth a test"
+```
+
+Then run the suite the curated file drives:
+
+```bash
+uv run pytest tests/test_ask_buddy.py -k FeedbackRegressionEvals -v
+```
+
+`tests/regression_evals.json` is committed, so each curated case is enforced
+for everyone from then on. Curation is never lost: re-running the pull merges
+new candidates without touching cases you've already annotated or skipped.
+
+---
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push and pull request:
+
+| Job | What it does | Needs |
+|---|---|---|
+| `lint` | `ruff check .` | nothing |
+| `typecheck` | `mypy` over `src/ask_buddy` | `uv sync` |
+| `fast-tests` | The stdlib-only suites — citations, eval curation, logging, lifecycle, rate limits, corpora (seconds) | nothing |
+| `offline-tests` | `pytest -m "not integration"` — 247 tests | `uv sync` |
+| `integration-tests` | Ingests both corpora into a pgvector service container, then `pytest -m integration`, including the curated regression evals | `GOOGLE_API_KEY` secret |
+
+The integration job self-skips when no `GOOGLE_API_KEY` secret is set, so forks
+and fresh clones stay green. Run the same checks locally:
+
+```bash
+uv run ruff check .
+uv run pytest -m "not integration" -v
+```
 
 ---
 
@@ -364,6 +494,15 @@ All retrieval is scoped by the `corpus` column so HR and IT results never mix, e
 | `MODEL_NAME` | No | `gpt-4o` | Model name for the LLM |
 | `ASK_BUDDY_FEWSHOT` | No | `0` | Number of top-rated past answers to inject as few-shot examples |
 | `ASK_BUDDY_DIGEST_CHANNEL` | No | — | Channel ID for the weekly feedback digest |
+| `ASK_BUDDY_LOG_FORMAT` | No | `text` | `json` for one object per line |
+| `ASK_BUDDY_LOG_LEVEL` | No | `INFO` | Root log level |
+| `ASK_BUDDY_SHUTDOWN_WAIT` | No | `10` | Seconds to drain in-flight answers on SIGTERM |
+| `ASK_BUDDY_DB_POOL_MAX` | No | `10` | Max pooled Postgres connections |
+| `ASK_BUDDY_MISFIRE_GRACE_SECONDS` | No | `3600` | How late a missed reminder may still fire |
+| `ASK_BUDDY_RATE_LIMIT_PER_USER` | No | `0` | Requests per user per window (0 = off) |
+| `ASK_BUDDY_RATE_LIMIT_WINDOW_SEC` | No | `60` | Rate-limit window length |
+| `ASK_BUDDY_DAILY_REQUEST_CAP` | No | `0` | Total requests per UTC day (0 = off) |
+| `ASK_BUDDY_SKIP_SLACK_VERIFY` | No | — | Skip `auth.test` at startup (tests/CI only) |
 | `GITHUB_TOKEN` | No | — | Fine-grained PAT for GitHub access |
 | `GITHUB_API_URL` | No | `https://api.github.com` | Override for GitHub Enterprise |
 | `GIT_WATCH_REPOS` | No | — | Comma-separated `owner/repo` list to watch |
@@ -388,6 +527,8 @@ All retrieval is scoped by the `corpus` column so HR and IT results never mix, e
 │   ├── db.py                       Schema init, connection helper, all DB helpers
 │   ├── ingest.py                   Chunking, embedding, and corpus-aware ingestion
 │   ├── retrieve.py                 hr_retrieve, it_retrieve @tools (vector + FTS + RRF)
+│   ├── citations.py                Deterministic Source(s) validation (stdlib only)
+│   ├── eval_curate.py              Turn 👎 feedback into committed regression tests
 │   ├── slack_listener.py           Slack Bolt Socket Mode entry point
 │   ├── scheduler.py                APScheduler-based reminder system
 │   ├── feedback.py                 Block Kit feedback buttons and modals
@@ -398,8 +539,12 @@ All retrieval is scoped by the `corpus` column so HR and IT results never mix, e
 │   └── git_digest.py               Scheduled repo state digest
 │
 ├── tests/
-│   └── test_ask_buddy.py           54 offline unit tests + integration test suite
+│   ├── test_ask_buddy.py           Offline unit tests + integration test suite
+│   ├── test_citations.py           Citation validator (no DB, no network)
+│   ├── test_eval_curate.py         Eval curation logic (no DB, no network)
+│   └── regression_evals.json       Curated regression cases (created by eval_curate)
 │
+├── .github/workflows/ci.yml        Lint + test pipeline
 ├── docker-compose.askbuddy.yml     pgvector/pg16 container definition
 ├── INSTALLATION.md                 Step-by-step setup guide
 ├── SLACK_PERMISSIONS.md            Slack app scopes and troubleshooting reference
