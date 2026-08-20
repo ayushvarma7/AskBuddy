@@ -15,10 +15,11 @@ import os
 from datetime import date
 from typing import Any
 
-import psycopg2.extras
 from langchain_core.tools import tool
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from pydantic import SecretStr
 
+from .corpora import CORPORA, Corpus
 from .db import get_conn, get_chunk_quality
 
 EMBED_MODEL = "models/gemini-embedding-001"
@@ -48,7 +49,9 @@ def _get_embedder() -> Any:
     if _embedder is None:
         _embedder = GoogleGenerativeAIEmbeddings(
             model=EMBED_MODEL,
-            google_api_key=key,
+            # 'api_key' is the field's declared alias, and it is typed
+            # SecretStr — so the key never lands in a repr or traceback.
+            api_key=SecretStr(key),
             output_dimensionality=768,     # match ingest dimensions
         )
     return _embedder
@@ -85,7 +88,25 @@ def _vector_search(embedding: list[float], pool: int,
 
 def _keyword_search(query: str, pool: int,
                     corpus: str | None = None) -> list[dict]:
-    """Return up to `pool` chunks ordered by Postgres full-text rank."""
+    """
+    Return up to `pool` chunks ordered by Postgres full-text rank.
+
+    Terms are combined with OR, not AND. This matters more than it looks:
+    plainto_tsquery ANDs every lexeme, so "How many days of PTO do I get after
+    5 years of service?" becomes
+    'mani' & 'day' & 'pto' & 'get' & '5' & 'year' & 'servic'
+    and matches *nothing* — no single chunk contains all of those. Since that is
+    exactly the shape of question Slack sends, the keyword half of this hybrid
+    search was contributing zero results for real queries, quietly making
+    retrieval vector-only.
+
+    ORing the lexemes restores recall, and ts_rank_cd still supplies precision:
+    a chunk matching six terms outranks one matching two. RRF then does its job
+    with two genuinely independent signals.
+
+    The coalesce/nullif guard covers a query made entirely of stopwords, where
+    the lexeme list is empty and to_tsquery('') would raise a syntax error.
+    """
     corpus_filter = "AND corpus = %s" if corpus else ""
     sql = f"""
         SELECT
@@ -95,7 +116,20 @@ def _keyword_search(query: str, pool: int,
             chunk_text,
             effective_date,
             ts_rank_cd(bm25_tsvector, query) AS score
-        FROM hr_chunks, plainto_tsquery('english', %s) query
+        FROM hr_chunks,
+             to_tsquery(
+                 'english',
+                 coalesce(
+                     nullif(
+                         array_to_string(
+                             tsvector_to_array(to_tsvector('english', %s)),
+                             ' | '
+                         ),
+                         ''
+                     ),
+                     'zzzznomatchzzzz'
+                 )
+             ) query
         WHERE bm25_tsvector @@ query
         {corpus_filter}
         ORDER BY score DESC
@@ -209,28 +243,43 @@ def hybrid_retrieve(query: str, top_k: int = 5) -> list[dict[str, Any]]:
     return _hybrid_retrieve_core(query, top_k, corpus="hr")
 
 
-@tool
-def hr_retrieve(query: str, top_k: int = 5) -> list[dict[str, Any]]:
-    """
-    Retrieve HR policy chunks (PTO, benefits, leave, expenses, conduct,
-    performance reviews, remote work) for `query`.
-
-    Returns a list of dicts with chunk_text, source_filename, section,
-    effective_date, and rrf_score. Always cite source_filename, section,
-    and effective_date in your answer.
-    """
-    return _hybrid_retrieve_core(query, top_k, corpus="hr")
+# ---------------------------------------------------------------------------
+# Per-corpus retrieval tools, built from the registry
+# ---------------------------------------------------------------------------
+#
+# One @tool per entry in corpora.CORPORA, so adding a domain needs no edit
+# here. The docstring matters: it is what the LLM reads to decide whether the
+# tool is the right one to call, so the corpus's topic list goes into it.
 
 
-@tool
-def it_retrieve(query: str, top_k: int = 5) -> list[dict[str, Any]]:
-    """
-    Retrieve IT security and infrastructure policy chunks (passwords,
-    VPN, MFA, device management, data classification, acceptable use)
-    for `query`.
+def _build_retrieve_tool(corpus: Corpus) -> Any:
+    """Create the corpus-scoped retrieval @tool for one domain."""
 
-    Returns a list of dicts with chunk_text, source_filename, section,
-    effective_date, and rrf_score. Always cite source_filename, section,
-    and effective_date in your answer.
-    """
-    return _hybrid_retrieve_core(query, top_k, corpus="it")
+    def _retrieve(query: str, top_k: int = 5) -> list[dict[str, Any]]:
+        return _hybrid_retrieve_core(query, top_k, corpus=corpus.name)
+
+    _retrieve.__name__ = corpus.tool_name
+    _retrieve.__doc__ = (
+        f"Retrieve {corpus.label} policy chunks ({corpus.topics}) for `query`.\n\n"
+        "Returns a list of dicts with chunk_text, source_filename, section, "
+        "effective_date, and rrf_score. Always cite source_filename, section, "
+        "and effective_date in your answer."
+    )
+    return tool(_retrieve)
+
+
+#: corpus name -> its retrieval @tool
+RETRIEVE_TOOLS: dict[str, Any] = {
+    corpus.name: _build_retrieve_tool(corpus) for corpus in CORPORA
+}
+
+
+def retrieve_tool_for(corpus_name: str) -> Any:
+    """The retrieval tool for one corpus."""
+    return RETRIEVE_TOOLS[corpus_name]
+
+
+# Named bindings for the two corpora that shipped first. Tests and any external
+# callers import these directly, and the supervisor prompt names them.
+hr_retrieve = RETRIEVE_TOOLS["hr"]
+it_retrieve = RETRIEVE_TOOLS["it"]
