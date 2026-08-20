@@ -1,0 +1,176 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      # Ruff needs no project dependencies, so this stays fast and can't be
+      # broken by an unrelated install failure.
+      - name: ruff check
+        run: uvx ruff@0.16.3 check .
+
+  typecheck:
+    name: Type check (mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      # Needs the project's dependencies installed to resolve imports, even
+      # with ignore_missing_imports — mypy still has to find first-party modules.
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: mypy
+        run: uv run mypy
+
+  fast-tests:
+    name: Fast tests (no dependencies)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      # citations.py and eval_curate.py are deliberately dependency-light, so
+      # the guardrail logic and the eval-curation logic are verified in seconds
+      # even if the heavier install below has a bad day.
+      - name: Citation + eval-curation tests
+        run: |
+          uv run --no-project --with pytest --with python-dotenv \
+            python -m pytest tests/test_citations.py tests/test_eval_curate.py -v
+
+  offline-tests:
+    name: Offline test suite
+    runs-on: ubuntu-latest
+    env:
+      # The offline suite still constructs real objects, so several import-time
+      # and constructor-time credential checks have to be satisfied. Every value
+      # here is a placeholder — verified locally that nothing in this job opens a
+      # socket or calls an API.
+      #
+      # slack_listener._require_env sys.exit()s without these two:
+      SLACK_BOT_TOKEN: xoxb-placeholder-not-a-real-token
+      SLACK_APP_TOKEN: xapp-1-placeholder-not-a-real-token
+      GOOGLE_API_KEY: placeholder-unused-offline
+      ASK_BUDDY_DB_DSN: postgresql://askbuddy:askbuddy_secret@localhost:5432/askbuddy
+      # CugaAgent construction builds an LLM client, and CUGA defaults to the
+      # OpenAI provider — the client refuses to instantiate without a key.
+      OPENAI_API_KEY: placeholder-unused-offline
+      # github_client._headers() raises before the mocked transport is reached.
+      GITHUB_TOKEN: github_pat_placeholder_unused_offline
+      # Skip slack_bolt's startup auth.test call — the token above is fake.
+      ASK_BUDDY_SKIP_SLACK_VERIFY: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      # Not --frozen: uv.lock predates the [dependency-groups] entry and uv
+      # will refresh it here. Run `uv lock` locally and commit the result to
+      # make this step reproducible.
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      # Integration tests are deselected here: they need a live Postgres and a
+      # real GOOGLE_API_KEY. See the integration-tests job below.
+      - name: pytest (offline only)
+        run: uv run pytest -m "not integration" -v
+
+  integration-tests:
+    name: Integration tests (pgvector + Gemini)
+    runs-on: ubuntu-latest
+    # Only meaningful once a GOOGLE_API_KEY secret exists. The job self-skips
+    # without one rather than failing, so forks and fresh clones stay green.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: askbuddy
+          POSTGRES_USER: askbuddy
+          POSTGRES_PASSWORD: askbuddy_secret
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U askbuddy -d askbuddy"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ASK_BUDDY_DB_DSN: postgresql://askbuddy:askbuddy_secret@localhost:5432/askbuddy
+      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for an API key
+        id: guard
+        run: |
+          if [ -z "${GOOGLE_API_KEY}" ]; then
+            echo "No GOOGLE_API_KEY secret set — skipping integration tests."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: astral-sh/setup-uv@v5
+        if: steps.guard.outputs.run == 'true'
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        if: steps.guard.outputs.run == 'true'
+        run: uv python install 3.13
+
+      - name: Install dependencies
+        if: steps.guard.outputs.run == 'true'
+        run: uv sync --group dev
+
+      - name: Ingest both corpora
+        if: steps.guard.outputs.run == 'true'
+        run: |
+          uv run python -m src.ask_buddy.ingest --clear
+          uv run python -m src.ask_buddy.ingest --corpus it --clear
+
+      # Only the integration-marked tests: the rest already ran in the
+      # offline-tests job, and they need a different set of placeholder
+      # credentials. Includes TestFeedbackRegressionEvals, so every case
+      # curated via `python -m src.ask_buddy.eval_curate` is enforced here.
+      - name: pytest (integration only)
+        if: steps.guard.outputs.run == 'true'
+        run: uv run pytest -m integration -v

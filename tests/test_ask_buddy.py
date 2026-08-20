@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import os
 import pytest
-from unittest.mock import patch, MagicMock
 
 
 # ---------------------------------------------------------------------------
@@ -30,10 +29,27 @@ def _env_available() -> bool:
     )
 
 
-integration = pytest.mark.skipif(
+_requires_live_env = pytest.mark.skipif(
     not _env_available(),
     reason="Integration tests require GOOGLE_API_KEY and ASK_BUDDY_DB_DSN",
 )
+
+
+def integration(obj):
+    """
+    Mark a test as needing a live Postgres and real API credentials.
+
+    Applies two things, and both are needed:
+
+    * ``pytest.mark.integration`` so ``-m "not integration"`` actually
+      deselects it. This used to be a bare skipif, which meant the documented
+      offline command silently ran every DB test anyway — and passed only
+      because an unset DSN made the skipif fire. Setting a placeholder DSN
+      (as CI does) turned that into a wall of failures.
+    * the skipif, so a plain ``pytest`` run on a machine without the
+      environment still skips instead of failing.
+    """
+    return pytest.mark.integration(_requires_live_env(obj))
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +415,6 @@ class TestAgentMockedSlack:
             return [fake_chunk]
 
         # Replace the module-level binding so build_agent picks up the fake
-        original = retrieve_mod.hybrid_retrieve
         monkeypatch.setattr(retrieve_mod, "hybrid_retrieve", fake_hybrid_retrieve)
         monkeypatch.setattr(agent_mod, "hybrid_retrieve", fake_hybrid_retrieve)
 
@@ -459,15 +474,20 @@ def _load_curated_evals() -> list[dict]:
     reason="No curated tests/regression_evals.json with expected_sources",
 )
 class TestFeedbackRegressionEvals:
-    @pytest.mark.parametrize("case", _load_curated_evals())
+    @pytest.mark.parametrize("case", _load_curated_evals(),
+                             ids=lambda c: c["question"][:50])
     def test_expected_source_is_retrieved(self, case):
-        from src.ask_buddy.retrieve import hr_retrieve
-        results = hr_retrieve.invoke({"query": case["question"], "top_k": 8})
+        from src.ask_buddy.retrieve import retrieve_tool_for
+        # Each case records its corpus: an IT document is unreachable through
+        # hr_retrieve, so testing every case against HR would fail by design.
+        corpus = case.get("corpus", "hr")
+        results = retrieve_tool_for(corpus).invoke(
+            {"query": case["question"], "top_k": 8})
         got = {r.get("source_filename") for r in results if "error" not in r}
         expected = set(case["expected_sources"])
         assert got & expected, (
             f"Regression: {case['question']!r} should surface one of "
-            f"{expected}; retrieval returned {got}"
+            f"{expected} via {corpus}_retrieve; retrieval returned {got}"
         )
 
 
@@ -876,11 +896,16 @@ class TestGitHubClientWriteActions:
 
 class TestGitAgentWriteTools:
     def test_git_issue_agent_has_write_tools(self):
-        from src.ask_buddy.agent import build_git_issue_agent
-        agent = build_git_issue_agent(slack_post_fn=lambda ch, txt: None)
-        tool_names = {t.name for t in agent._tools} if hasattr(agent, "_tools") else set()
-        # If _tools isn't the attribute name, fall back to checking the agent builds
-        assert agent is not None
+        from src.ask_buddy.agent import (
+            _build_git_dangerous_tools, _build_git_write_tools,
+        )
+        write_tools = {t.name for t in _build_git_write_tools()}
+        dangerous_tools = {t.name for t in _build_git_dangerous_tools()}
+        assert "add_issue_comment" in write_tools
+        assert "add_labels" in write_tools
+        assert "assign_users" in write_tools
+        assert "create_issue" in write_tools
+        assert "set_issue_state" in dangerous_tools
 
     def test_git_pr_agent_has_merge_and_file_tools(self):
         from src.ask_buddy.agent import _build_git_pr_tools, _build_git_dangerous_tools
@@ -912,6 +937,36 @@ class TestPendingApprovalRegistry:
     def test_pop_missing_thread_returns_none(self):
         import src.ask_buddy.slack_listener as sl
         assert sl._pop_pending_approval("does-not-exist") is None
+
+    def test_stash_refuses_to_clobber_a_pending_approval(self):
+        """Two concurrent messages from one user share a thread_id. Replacing
+        the first stash would strand the Confirm/Cancel buttons already showing
+        in Slack, so the second request must be refused instead."""
+        import src.ask_buddy.slack_listener as sl
+        assert sl._stash_pending_approval("dup", supervisor="FIRST", channel="C1",
+                                          user_text="merge PR #1", agent_config="cfg",
+                                          retrieved_chunk_ids=[]) is True
+        assert sl._stash_pending_approval("dup", supervisor="SECOND", channel="C1",
+                                          user_text="close issue #9", agent_config="cfg",
+                                          retrieved_chunk_ids=[]) is False
+        # The original is intact and still resumable.
+        popped = sl._pop_pending_approval("dup")
+        assert popped["supervisor"] == "FIRST"
+        assert popped["user_text"] == "merge PR #1"
+
+    def test_stash_carries_thread_ts_for_the_reply(self):
+        import src.ask_buddy.slack_listener as sl
+        sl._stash_pending_approval("t-thread", supervisor="F", channel="C",
+                                   user_text="x", agent_config="cfg",
+                                   retrieved_chunk_ids=[], thread_ts="1700000000.001")
+        assert sl._pop_pending_approval("t-thread")["thread_ts"] == "1700000000.001"
+
+    def test_stash_thread_ts_defaults_to_none_for_dms(self):
+        import src.ask_buddy.slack_listener as sl
+        sl._stash_pending_approval("t-dm", supervisor="F", channel="D1",
+                                   user_text="x", agent_config="cfg",
+                                   retrieved_chunk_ids=[])
+        assert sl._pop_pending_approval("t-dm")["thread_ts"] is None
 
     def test_sweep_evicts_only_expired(self):
         import src.ask_buddy.slack_listener as sl
@@ -1185,3 +1240,365 @@ class TestGitWatchRateLimitSkip:
             gw.poll_once("a/b", lambda ch, txt: None)
 
         assert any("rate limited" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Event routing and threaded replies
+# ---------------------------------------------------------------------------
+
+class TestDirectMessageGuard:
+    """The 'message' event also fires for channels once the app subscribes to
+    message.channels — the handler must filter on channel_type itself rather
+    than trusting the Slack event subscription to stay narrow."""
+
+    def test_dm_is_handled(self):
+        import src.ask_buddy.slack_listener as sl
+        assert sl._is_direct_message({"channel_type": "im", "text": "hi"})
+
+    def test_public_channel_message_is_ignored(self):
+        import src.ask_buddy.slack_listener as sl
+        assert not sl._is_direct_message({"channel_type": "channel", "text": "hi"})
+
+    def test_private_channel_message_is_ignored(self):
+        import src.ask_buddy.slack_listener as sl
+        assert not sl._is_direct_message({"channel_type": "group", "text": "hi"})
+
+    def test_group_dm_is_ignored(self):
+        import src.ask_buddy.slack_listener as sl
+        assert not sl._is_direct_message({"channel_type": "mpim", "text": "hi"})
+
+    def test_missing_channel_type_is_ignored(self):
+        import src.ask_buddy.slack_listener as sl
+        assert not sl._is_direct_message({"text": "hi"})
+
+
+class TestThreadKwargs:
+    def test_thread_ts_is_passed_through(self):
+        import src.ask_buddy.slack_listener as sl
+        assert sl._thread_kwargs("1700000000.001") == {"thread_ts": "1700000000.001"}
+
+    def test_none_yields_no_kwarg(self):
+        import src.ask_buddy.slack_listener as sl
+        assert sl._thread_kwargs(None) == {}
+
+    def test_empty_string_yields_no_kwarg(self):
+        import src.ask_buddy.slack_listener as sl
+        assert sl._thread_kwargs("") == {}
+
+
+class TestPromptFingerprint:
+    """agent_config must distinguish a prompt edit from a model swap."""
+
+    def test_fingerprint_is_short_stable_hex(self):
+        from src.ask_buddy.agent import prompt_fingerprint
+        first = prompt_fingerprint()
+        assert len(first) == 8
+        assert all(c in "0123456789abcdef" for c in first)
+        # Deterministic across calls in one process.
+        assert prompt_fingerprint() == first
+
+    def test_fingerprint_is_part_of_agent_config(self):
+        from src.ask_buddy.agent import current_agent_config, prompt_fingerprint
+        assert current_agent_config().endswith(f":p{prompt_fingerprint()}")
+
+    def test_agent_config_tracks_provider_and_model(self, monkeypatch):
+        from src.ask_buddy.agent import current_agent_config
+        monkeypatch.setenv("AGENT_SETTING_CONFIG", "settings.google.toml")
+        monkeypatch.setenv("MODEL_NAME", "gemini-2.5-flash")
+        config = current_agent_config()
+        assert config.startswith("settings.google.toml:gemini-2.5-flash:p")
+
+    def test_editing_a_prompt_changes_the_fingerprint(self, monkeypatch):
+        """Guards the whole point: a prompt change must be visible in the
+        config string the feedback report groups by."""
+        import src.ask_buddy.agent as agent_mod
+        before = agent_mod.prompt_fingerprint()
+        monkeypatch.setattr(agent_mod, "SUPERVISOR_PROMPT",
+                            agent_mod.SUPERVISOR_PROMPT + "\nAn extra rule.")
+        assert agent_mod.prompt_fingerprint() != before
+
+
+# ---------------------------------------------------------------------------
+# Corpus registry — the derived artifacts
+# ---------------------------------------------------------------------------
+
+class TestCorpusRegistryDerivation:
+    """Everything a corpus needs is generated from its registry entry, so a
+    new domain can't be half-wired."""
+
+    def test_a_retrieval_tool_exists_per_corpus(self):
+        from src.ask_buddy.corpora import CORPORA
+        from src.ask_buddy.retrieve import RETRIEVE_TOOLS
+        assert set(RETRIEVE_TOOLS) == {c.name for c in CORPORA}
+
+    def test_tool_names_match_the_registry(self):
+        from src.ask_buddy.corpora import CORPORA
+        from src.ask_buddy.retrieve import retrieve_tool_for
+        for corpus in CORPORA:
+            assert retrieve_tool_for(corpus.name).name == corpus.tool_name
+
+    def test_tool_docstring_carries_the_topics_for_routing(self):
+        """The LLM picks a tool from its description, so the topics must be in
+        there."""
+        from src.ask_buddy.corpora import by_name
+        from src.ask_buddy.retrieve import retrieve_tool_for
+        corpus = by_name("it")
+        description = retrieve_tool_for("it").description
+        assert "VPN" in description
+        assert corpus.label in description
+
+    def test_named_bindings_still_point_at_the_generated_tools(self):
+        from src.ask_buddy.retrieve import RETRIEVE_TOOLS, hr_retrieve, it_retrieve
+        assert hr_retrieve is RETRIEVE_TOOLS["hr"]
+        assert it_retrieve is RETRIEVE_TOOLS["it"]
+
+    def test_a_prompt_exists_per_corpus(self):
+        from src.ask_buddy.agent import DOMAIN_PROMPTS
+        from src.ask_buddy.corpora import CORPORA
+        assert set(DOMAIN_PROMPTS) == {c.name for c in CORPORA}
+
+    def test_every_domain_prompt_carries_the_shared_guardrails(self):
+        """The anti-hallucination block must not be something a new corpus can
+        forget to include."""
+        from src.ask_buddy.agent import DOMAIN_PROMPTS
+        for name, prompt in DOMAIN_PROMPTS.items():
+            assert "Never answer from general knowledge." in prompt, name
+            assert "No results found in our documents" in prompt, name
+            assert "Source(s):" in prompt, name
+
+    def test_domain_prompt_names_its_own_tool(self):
+        from src.ask_buddy.agent import DOMAIN_PROMPTS
+        from src.ask_buddy.corpora import CORPORA
+        for corpus in CORPORA:
+            assert corpus.tool_name in DOMAIN_PROMPTS[corpus.name]
+
+    def test_supervisor_prompt_routes_to_every_corpus(self):
+        """A corpus the supervisor doesn't mention is unreachable."""
+        from src.ask_buddy.agent import SUPERVISOR_PROMPT
+        from src.ask_buddy.corpora import CORPORA
+        for corpus in CORPORA:
+            assert corpus.agent_name in SUPERVISOR_PROMPT
+
+    def test_supervisor_registers_an_agent_per_corpus(self):
+        from src.ask_buddy.agent import build_supervisor
+        from src.ask_buddy.corpora import CORPORA
+        supervisor = build_supervisor(slack_post_fn=lambda ch, txt: None)
+        for corpus in CORPORA:
+            assert corpus.agent_name in supervisor._agents
+
+    def test_domain_agent_gets_only_its_own_retrieval_tool(self, monkeypatch):
+        """Corpus isolation is enforced by the tool list, not just the prompt.
+
+        Captures what build_domain_agent passes to CugaAgent rather than
+        reaching into the constructed agent, so this doesn't depend on CUGA's
+        internal attribute names.
+        """
+        import src.ask_buddy.agent as agent_mod
+        from src.ask_buddy.corpora import by_name
+
+        captured: dict = {}
+
+        class RecordingAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr(agent_mod, "CugaAgent", RecordingAgent)
+        agent_mod.build_domain_agent(by_name("it"), slack_post_fn=lambda ch, txt: None)
+
+        names = {t.name for t in captured["tools"]}
+        assert names == {"it_retrieve", "post_slack_message"}
+        assert captured["enable_knowledge"] is False
+
+    def test_domain_agent_prompt_is_its_own(self, monkeypatch):
+        import src.ask_buddy.agent as agent_mod
+        from src.ask_buddy.corpora import by_name
+
+        captured: dict = {}
+
+        class RecordingAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr(agent_mod, "CugaAgent", RecordingAgent)
+        agent_mod.build_domain_agent(by_name("hr"), slack_post_fn=lambda ch, txt: None)
+        assert "hr_retrieve" in captured["special_instructions"]
+        assert "it_retrieve" not in captured["special_instructions"]
+
+
+# ---------------------------------------------------------------------------
+# Integration: the SQL added for citation validation and approval auditing
+# ---------------------------------------------------------------------------
+#
+# These exist because the DDL and queries below can only be verified against a
+# real Postgres. CI's integration job runs them after ingest.
+
+@integration
+class TestCitationSchemaAndQueries:
+    def test_citation_status_column_exists(self):
+        from src.ask_buddy.db import get_conn
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_name = 'ask_buddy_feedback'
+                      AND column_name = 'citation_status';
+                """)
+                assert cur.fetchone() is not None
+
+    def test_get_known_sources_returns_ingested_metadata(self):
+        from src.ask_buddy.db import get_known_sources
+        known = get_known_sources(force_refresh=True)
+        assert known, "corpus appears empty — run ingest first"
+        filenames = {f for f, _ in known}
+        assert "pto_policy.md" in filenames
+        assert all(isinstance(f, str) and isinstance(s, str) for f, s in known)
+
+    def test_known_sources_validate_a_real_citation(self):
+        """End-to-end: metadata from the DB satisfies the validator."""
+        from src.ask_buddy.citations import STATUS_OK, validate_citations
+        from src.ask_buddy.db import get_known_sources
+        known = get_known_sources(force_refresh=True)
+        filename, section = sorted(known)[0]
+        answer = f"Some answer.\n\nSource(s): {filename} — {section}"
+        assert validate_citations(answer, known).status == STATUS_OK
+
+    def test_known_sources_reject_a_fabricated_citation(self):
+        from src.ask_buddy.citations import STATUS_UNKNOWN_FILE, validate_citations
+        from src.ask_buddy.db import get_known_sources
+        known = get_known_sources(force_refresh=True)
+        answer = "Some answer.\n\nSource(s): definitely_not_a_real_doc.md — Nope"
+        assert validate_citations(answer, known).status == STATUS_UNKNOWN_FILE
+
+    def test_known_sources_cache_is_reused(self):
+        from src.ask_buddy.db import get_known_sources
+        first = get_known_sources(force_refresh=True)
+        assert get_known_sources() == first
+
+    def test_citation_status_counts_query_runs(self):
+        from src.ask_buddy.db import get_citation_status_counts
+        rows = get_citation_status_counts()
+        assert isinstance(rows, list)
+        for row in rows:
+            assert "citation_status" in row and "hits" in row
+
+    def test_bad_citation_rows_query_runs(self):
+        from src.ask_buddy.db import get_bad_citation_rows
+        assert isinstance(get_bad_citation_rows(limit=5), list)
+
+    def test_chunk_quality_cache_and_refresh(self):
+        from src.ask_buddy.db import get_chunk_quality
+        cached = get_chunk_quality()
+        assert isinstance(cached, dict)
+        assert isinstance(get_chunk_quality(force_refresh=True), dict)
+
+
+@integration
+class TestPendingApprovalPersistence:
+    def _clean(self, thread_id):
+        from src.ask_buddy.db import get_conn
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM ask_buddy_pending_approvals "
+                            "WHERE thread_id = %s;", (thread_id,))
+
+    def test_insert_then_resolve_roundtrip(self):
+        from src.ask_buddy.db import (
+            get_unresolved_approvals, insert_pending_approval,
+            resolve_pending_approval,
+        )
+        thread_id = "test-approval-roundtrip"
+        self._clean(thread_id)
+        try:
+            row_id = insert_pending_approval(
+                thread_id=thread_id, channel="C1", user_text="merge PR #1",
+                user_id="U1", thread_ts="1700000000.001", agent_config="cfg",
+            )
+            assert row_id is not None
+            assert any(r["thread_id"] == thread_id for r in get_unresolved_approvals())
+
+            assert resolve_pending_approval(thread_id, "confirmed", resolved_by="U1")
+            assert not any(r["thread_id"] == thread_id
+                           for r in get_unresolved_approvals())
+            # A second resolve finds nothing left to close.
+            assert not resolve_pending_approval(thread_id, "cancelled")
+        finally:
+            self._clean(thread_id)
+
+    def test_only_one_unresolved_row_per_thread(self):
+        """The partial unique index mirrors the in-memory no-clobber rule."""
+        from src.ask_buddy.db import insert_pending_approval
+        thread_id = "test-approval-dup"
+        self._clean(thread_id)
+        try:
+            first = insert_pending_approval(thread_id=thread_id, channel="C1",
+                                            user_text="merge PR #1")
+            second = insert_pending_approval(thread_id=thread_id, channel="C1",
+                                             user_text="close issue #9")
+            assert first is not None
+            assert second is None      # rejected, not raised
+        finally:
+            self._clean(thread_id)
+
+    def test_orphaning_closes_everything_out(self):
+        from src.ask_buddy.db import (
+            get_unresolved_approvals, insert_pending_approval,
+            orphan_unresolved_approvals,
+        )
+        thread_id = "test-approval-orphan"
+        self._clean(thread_id)
+        try:
+            insert_pending_approval(thread_id=thread_id, channel="C1",
+                                    user_text="merge PR #2")
+            orphaned = orphan_unresolved_approvals()
+            assert any(r["thread_id"] == thread_id for r in orphaned)
+            assert get_unresolved_approvals() == []
+        finally:
+            self._clean(thread_id)
+
+
+@integration
+class TestKeywordSearchUsesOrSemantics:
+    """
+    Guards a defect that made hybrid retrieval silently vector-only.
+
+    plainto_tsquery ANDs every lexeme, so a natural-language question
+    ("How many days of PTO do I get after 5 years of service?") produced
+    'mani' & 'day' & 'pto' & ... and matched no chunk at all — the exact shape
+    of question Slack sends. The keyword half of RRF contributed nothing.
+    """
+
+    QUESTION = "How many days of PTO do I get after 5 years of service?"
+
+    def test_natural_language_question_matches_something(self):
+        from src.ask_buddy.retrieve import _keyword_search
+        rows = _keyword_search(self.QUESTION, pool=20, corpus="hr")
+        assert rows, "keyword search returned nothing for a natural question"
+
+    def test_expected_document_ranks_first(self):
+        from src.ask_buddy.retrieve import _keyword_search
+        rows = _keyword_search(self.QUESTION, pool=20, corpus="hr")
+        assert rows[0]["source_filename"] == "pto_policy.md"
+
+    def test_ranking_still_discriminates(self):
+        """OR semantics must not flatten the ranking — a chunk matching more
+        terms has to outrank one matching fewer."""
+        from src.ask_buddy.retrieve import _keyword_search
+        rows = _keyword_search(self.QUESTION, pool=20, corpus="hr")
+        scores = [float(r["score"]) for r in rows]
+        assert scores == sorted(scores, reverse=True)
+        assert scores[0] > scores[-1], "all results scored identically"
+
+    def test_corpus_filter_still_applies(self):
+        from src.ask_buddy.retrieve import _keyword_search
+        rows = _keyword_search("password rotation VPN policy", pool=20, corpus="it")
+        assert rows
+        assert {r["source_filename"] for r in rows} == {"it_security_policy.md"}
+
+    def test_all_stopword_query_returns_empty_not_an_error(self):
+        """to_tsquery('') raises a syntax error; the coalesce guard covers it."""
+        from src.ask_buddy.retrieve import _keyword_search
+        assert _keyword_search("the and of", pool=20, corpus="hr") == []
+
+    def test_empty_query_returns_empty_not_an_error(self):
+        from src.ask_buddy.retrieve import _keyword_search
+        assert _keyword_search("", pool=20, corpus="hr") == []
