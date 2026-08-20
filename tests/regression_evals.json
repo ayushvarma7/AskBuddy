@@ -1,0 +1,91 @@
+[
+  {
+    "question": "How many days of PTO do I get after 5 years of service?",
+    "was_refusal": false,
+    "reason": null,
+    "sources_cited": "",
+    "expected_answer": "",
+    "expected_sources": [
+      "pto_policy.md"
+    ],
+    "corpus": "hr"
+  },
+  {
+    "question": "What were the PTO accrual rates before 2024, under the old policy?",
+    "was_refusal": false,
+    "reason": null,
+    "sources_cited": "",
+    "expected_answer": "",
+    "expected_sources": [
+      "pto_policy.md"
+    ],
+    "corpus": "hr"
+  },
+  {
+    "question": "How do I add my newborn to health insurance after parental leave?",
+    "was_refusal": false,
+    "reason": null,
+    "sources_cited": "",
+    "expected_answer": "",
+    "expected_sources": [
+      "parental_leave.md",
+      "benefits_enrollment.md"
+    ],
+    "corpus": "hr"
+  },
+  {
+    "question": "What do I get when I have a baby?",
+    "was_refusal": false,
+    "reason": null,
+    "sources_cited": "",
+    "expected_answer": "",
+    "expected_sources": [
+      "parental_leave.md"
+    ],
+    "corpus": "hr"
+  },
+  {
+    "question": "Can I expense a client dinner?",
+    "was_refusal": false,
+    "reason": null,
+    "sources_cited": "",
+    "expected_answer": "",
+    "expected_sources": [
+      "expense_reimbursement.md"
+    ],
+    "corpus": "hr"
+  },
+  {
+    "question": "How often do performance reviews happen?",
+    "was_refusal": false,
+    "reason": null,
+    "sources_cited": "",
+    "expected_answer": "",
+    "expected_sources": [
+      "performance_reviews.md"
+    ],
+    "corpus": "hr"
+  },
+  {
+    "question": "Am I allowed to work from another country?",
+    "was_refusal": false,
+    "reason": null,
+    "sources_cited": "",
+    "expected_answer": "",
+    "expected_sources": [
+      "remote_work_policy.md"
+    ],
+    "corpus": "hr"
+  },
+  {
+    "question": "What is the company's password rotation policy and VPN requirements?",
+    "was_refusal": false,
+    "reason": null,
+    "sources_cited": "",
+    "expected_answer": "",
+    "expected_sources": [
+      "it_security_policy.md"
+    ],
+    "corpus": "it"
+  }
+]
