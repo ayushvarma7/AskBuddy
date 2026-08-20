@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   postgres:
     image: pgvector/pgvector:pg16
@@ -18,6 +16,25 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  askbuddy:
+    build: .
+    container_name: askbuddy_bot
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Socket Mode dials out to Slack, so no ports are published.
+    env_file:
+      - .env
+    environment:
+      # Override the .env default: inside the compose network Postgres is
+      # reachable as 'postgres', not localhost.
+      ASK_BUDDY_DB_DSN: postgresql://askbuddy:askbuddy_secret@postgres:5432/askbuddy
+      ASK_BUDDY_LOG_FORMAT: json
+    # Give in-flight answers time to finish before SIGKILL; matches the
+    # default ASK_BUDDY_SHUTDOWN_WAIT with headroom for the drain itself.
+    stop_grace_period: 20s
 
 volumes:
   askbuddy_pgdata:
